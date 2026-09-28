@@ -154,15 +154,40 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 |---|---|
 | 查余额 / 积分 | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-resource` |
 | 签到 | `POST https://www.codebuddy.cn/v2/billing/meter/daily-checkin` |
+| 连登状态 | `GET  https://www.workbuddy.cn/v2/activity/growth/streak` |
+| 兑换汇总 | `GET  https://www.workbuddy.cn/v2/activity/growth/redeem/summary` |
+| 兑换连登奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/redeem`，body `{"tier":"…","client_token":"…"}` |
+| 用补登卡 | `POST https://www.workbuddy.cn/v2/activity/growth/makeup-cards/use`，body `{"target_date":"YYYY-MM-DD"}` |
 | 猫猫状态 | `GET  https://www.workbuddy.cn/v2/activity/growth/buddy/travel/status` |
 | 领奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/claim` |
 | 派出去 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/depart` |
 
 认证头：`Authorization: Bearer <token>` + `X-User-Id: <uid>`。
 
+> 这些接口名不是猜的，是从产品自己的前端包 `growthSpace-CCYzF8bt.js`（仅 3.3 KB）
+> 里逐字抄下来的 —— 那是个把整组 API 常量写死的小 chunk。
+> 以后再要找新接口，照这个套路：入口页 → 主包列 chunk → 找几 KB 的常量包。
+
 ---
 
-## 九、目录结构
+## 九、成长中心「连续登录」怎么自动化的
+
+**结论：主要动作能自动，只有补登卡默认不动。**
+
+| 动作 | 是否自动 | 说明 |
+|---|---|---|
+| 每天「登录」 | ✅ 已被签到覆盖 | 连登定义为「连续登录**且使用** WorkBuddy 的天数」。每天的签到请求带真实 Bearer token，等价于登录并使用 —— **不需要开桌面端**。 |
+| 连登奖励兑换 | ✅ 默认自动 | 入门档 7 天 / 进阶档 14 天 / 巅峰档 28 天，**可多档累计，每档每月限兑 1 次**。脚本先读 `redeem/summary` 确认本月没兑过，再对每个已达档位兑一次。 |
+| 断登补签 | ⛔ 默认关闭 | 补登卡上限 4 张、永久持有、**不可逆**。默认只在报告里显示余额，不写入。要开就设 `WB_STREAK_MAKEUP=1`。 |
+| 任务系统 | ⛔ 未实现 | 「完成任务」多半依赖真实使用行为（如对话 N 次），脚本无法伪造；接受一个做不完的任务无收益。 |
+
+开关都在 `.env`：`WB_GROWTH`（总闸）/ `WB_STREAK_REDEEM` / `WB_STREAK_MAKEUP`。
+
+报告页有「连登状态」区块，显示每个账号的：当前连登天数 / 下一档位 / 补登卡余额 / 本月各档已兑次数。
+
+---
+
+## 十、目录结构
 
 ```
 docker/
@@ -171,7 +196,7 @@ docker/
 ├── .env.example               环境变量模板
 ├── .dockerignore              构建排除（含 .env，绝不进镜像）
 ├── app.py                     Web 控制台（标准库 ThreadingHTTPServer）
-├── wb_daily.py                签到 + 派猫 + 归档（cron 调用）
+├── wb_daily.py                签到 + 派猫 + 连登采集 + 归档（cron 调用）
 ├── wb_report.py               聚合报告渲染
 ├── deploy/
 │   ├── entrypoint.sh          起 supercronic + 前台 Web

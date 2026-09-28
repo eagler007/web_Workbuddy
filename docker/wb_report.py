@@ -431,6 +431,77 @@ def dedupe_by_day(runs):
     return out
 
 
+def _streak_text(a):
+    """账号卡里的「连续天数」。优先用新版 streak_days，退回旧版 streak 字段。"""
+    v = a.get("streak_days")
+    if v is None:
+        v = a.get("streak")
+    if v in (None, "-", ""):
+        return "-"
+    return "%s 天" % v
+
+
+def render_streak_block(last):
+    """「连登状态」区块。纯离线：只读归档字段，不发任何网络请求。
+
+    数据来自 wb_daily.py 阶段 A 采集并写入 accounts[] 的：
+      streak_days / streak_next_tier / makeup_cards / makeup_dates / redeem_summary
+    旧归档没有这些字段，一律降级显示 "—"。
+    """
+    if not last:
+        return '<div class="empty">暂无连登数据。等下一次运行后即可看到。</div>'
+    accts = last.get("accounts") or []
+    if not accts:
+        return '<div class="empty">暂无连登数据。</div>'
+    has_any = any(a.get("streak_days") is not None or a.get("makeup_cards") or
+                  a.get("redeem_summary") for a in accts)
+    if not has_any:
+        return ('<div class="empty">最近一次运行还没有连登数据'
+                '（接口未返回或已按 WB_GROWTH=0 跳过）。</div>')
+
+    # 档位中文名：前端定义 starter/advanced/legendary → 7d/14d/28d
+    tier_name = {"7d": "入门档", "14d": "进阶档", "28d": "巅峰档"}
+    tier_key = {"7d": "starter", "14d": "advanced", "28d": "legendary"}
+
+    rows = ['<div class="scroll"><table><thead><tr>'
+            '<th style="text-align:left">账号</th><th>当前连登</th><th>下一档</th>'
+            '<th>补登卡</th><th>本月已兑</th></tr></thead><tbody>']
+    for a in accts:
+        d = a.get("streak_days")
+        nt = a.get("streak_next_tier")
+        if d is None:
+            d_txt = "—"
+        else:
+            d_txt = "%s 天" % d
+        if nt:
+            nxt = nt if nt in tier_name else str(nt)
+            nxt_txt = "%s（%s）" % (tier_name.get(nt, nt), nt)
+        else:
+            nxt_txt = "已达最高档" if d is not None else "—"
+        mc = a.get("makeup_cards") or {}
+        if mc.get("balance") is not None:
+            cards_txt = "%s / %s 张" % (mc.get("balance"), mc.get("max", 4))
+        else:
+            cards_txt = "—"
+        rs = a.get("redeem_summary") or {}
+        if rs:
+            got = []
+            for tk, cn, tv in (("starter", "入门", "7d"), ("advanced", "进阶", "14d"),
+                               ("legendary", "巅峰", "28d")):
+                if rs.get(tk):
+                    got.append("%s×%s" % (cn, rs[tk]))
+            rs_txt = "、".join(got) if got else "均未兑"
+        else:
+            rs_txt = "—"
+        rows.append(
+            "<tr><td class='acc'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (html.escape(a.get("name") or mask(a.get("uid"))),
+               html.escape(d_txt), html.escape(nxt_txt),
+               html.escape(cards_txt), html.escape(rs_txt)))
+    rows.append("</tbody></table></div>")
+    return "".join(rows)
+
+
 def render_report(h, days=30, tasks=None, daily=True):
     runs = [r for r in h["runs"] if r.get("accounts")]
     if tasks:
@@ -464,7 +535,7 @@ def render_report(h, days=30, tasks=None, daily=True):
             rows = [
                 ("签到状态", a.get("checkin") or "-"),
                 ("本次积分", ("+%g" % round(a.get("diff") or 0, 2)) if a.get("diff") else "+0"),
-                ("连续天数", ("%s 天" % a.get("streak")) if a.get("streak") not in (None, "-") else "-"),
+                ("连续天数", _streak_text(a)),
                 ("余额", ("%.2f" % a["after"]) if a.get("after") is not None else "-"),
                 ("套餐", ("%.2f" % a["tc"]) if a.get("tc") is not None else "-"),
                 ("购买", ("%.2f" % a["buy"]) if a.get("buy") is not None else "-"),
@@ -558,6 +629,9 @@ def render_report(h, days=30, tasks=None, daily=True):
     det.append("</tbody></table></div>")
     detail_html = "".join(det)
 
+    # ---- 连登状态（阶段 A：只读采集，纯离线渲染）
+    streak_html = render_streak_block(last)
+
     n_acct = len(acct_cols)
     n_run = len(runs)
     span = ("%s ~ %s" % (show_dates[0], show_dates[-1])) if show_dates else "—"
@@ -580,6 +654,11 @@ def render_report(h, days=30, tasks=None, daily=True):
     %s
   </div>
   <div class="panel">
+    <h3>连登状态<span class="sub" style="padding:0 0 0 6px">最近一次</span></h3>
+    <div class="sub">「连续登录」= 连续登录且使用 WorkBuddy 的天数。档位：入门 7 天 / 进阶 14 天 / 巅峰 28 天，每档每月限兑 1 次。</div>
+    %s
+  </div>
+  <div class="panel">
     <h3>历史签到矩阵</h3>
     <div class="sub">行 = 日期，列 = 账号；「已签」表示当天签到成功但积分变化 &lt; 0.01；「·」表示当天没有这个账号的记录。</div>
     %s
@@ -594,15 +673,15 @@ def render_report(h, days=30, tasks=None, daily=True):
     %s
   </div>
   <div class="foot">
-    数据来源：QD 任务日志（权威历史，服务端保留天数由 QD「站点管理」设置） + 本地归档 <code>data/wb_history.json</code>。<br>
-    本页由 <code>wb_report.py</code> 生成，纯静态、无外部依赖。页面内不含任何 token。
+    数据来源：本地归档 <code>data/wb_history.json</code>。<br>
+    本页由 <code>wb_report.py</code> 生成，纯静态、无外部依赖、无网络调用。页面内不含任何 token。
   </div>
 </div></body></html>
 """ % (CSS, now, span, len(show_dates), n_run, n_acct,
        html.escape(last.get("ts") if last else "暂无运行记录"),
        "".join('<div class="card"><div class="v">%s</div><div class="k">%s</div></div>'
                % (html.escape(v), html.escape(k)) for k, v in cards),
-       acct_html, matrix_html, chart_html, detail_html)
+       acct_html, streak_html, matrix_html, chart_html, detail_html)
 
 
 def render_chart(daily):

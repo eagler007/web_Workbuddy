@@ -110,6 +110,14 @@ def mask(s, n=8):
     return (s[:n] + "…" + s[-4:]) if len(s) > n + 4 else (s[:n] + "…")
 
 
+def _env_on(name, default=False):
+    """环境开关：未设置用 default；'0'/'false'/'no'/'off'/'' 视为关，其余为开。"""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("", "0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------- 凭据
 def _creds_from_env():
     t = (os.environ.get("WORKBUDDY_ACCESS_TOKEN") or "").strip()
@@ -249,6 +257,9 @@ def make_run(ts_iso, accounts, cat, note, success=True):
             tot_after += after
         if before is not None:
             tot_before += before
+        gr = a.get("growth") or {}
+        sk = gr.get("streak") or {}
+        rs = gr.get("redeem") or {}
         a_list.append({
             "name": a["name"],
             "uid": a["uid"],
@@ -261,6 +272,16 @@ def make_run(ts_iso, accounts, cat, note, success=True):
             "tc": a.get("tc"),
             "buy": a.get("buy"),
             "rw": a.get("rw"),
+            # —— 连登/成长（阶段 A：只读采集）——
+            # 连登天数优先用签到响应里的 streak_days（200 成功时才有），
+            # 拿不到就退回 growth/streak 接口的值。两者取到的都是同一个数。
+            "streak_days": (ck.get("streak") if ck.get("streak") is not None
+                            else sk.get("days")),
+            "streak_next_tier": sk.get("next_tier"),
+            "makeup_cards": sk.get("makeup_cards") if sk.get("ok") else None,
+            "makeup_dates": sk.get("makeup_dates") if sk.get("ok") else None,
+            "redeem_summary": (rs.get("counts") if rs.get("ok") else None),
+            "growth_err": gr.get("err"),
         })
     summary = {
         "before": _r2(tot_before) if tot_before else None,
@@ -493,6 +514,135 @@ def cat_flow(token, uid, location_id, log, dry=False):
     return r
 
 
+# ---------------------------------------------------------------- 连续登录（成长中心）
+# 接口来源：本机 WorkBuddy 前端包 growthSpace-CCYzF8bt.js 里写死的 API 层，逐字对应：
+#   GET  /v2/activity/growth/streak           连续登录状态
+#   GET  /v2/activity/growth/redeem/summary   连登奖励兑换汇总（本月各档已兑次数）
+#   POST /v2/activity/growth/redeem           body {"tier": <"starter"|"advanced"|"legendary">,
+#                                                   "client_token": <客户端幂等键>}
+#   POST /v2/activity/growth/makeup-cards/use body {"target_date": <"YYYY-MM-DD">}
+#
+# 业务规则（页面文案原文）：
+#   - 档位：入门档 7 天 / 进阶档 14 天 / 巅峰档 28 天
+#   - 「连登天数可多档累计。每档每月限兑 1 次，连登天数每月清零并重新计算。」
+#   - 「当前连登天数计算方式为当前日期前连续登录且使用 WorkBuddy 的天数，
+#      奖励领取以当月最大连续登录且使用 WorkBuddy 的天数为准。」
+#   - 「补登卡为永久持有且上限 4 张，仅可补救当月断登的天数。」
+#
+# 阶段说明：当前（阶段 A）只做**只读**读取与展示，不发起任何写入。
+STREAK_TIERS = [("starter", "入门档", "7d"),
+                ("advanced", "进阶档", "14d"),
+                ("legendary", "巅峰档", "28d")]
+
+
+def get_streak(token, uid):
+    """读连续登录状态。返回结构化 dict（取不到就全 None，绝不抛异常）。"""
+    r = {"ok": False, "http": 0, "err": None, "days": None, "next_tier": None,
+         "makeup_dates": [], "makeup_cards": {"balance": None, "max": None},
+         "redeem_status": {}, "raw_body": ""}
+    try:
+        st, text = call("GET", HOST_ACTIVITY + "/v2/activity/growth/streak", token, uid)
+        r["http"] = st
+        r["raw_body"] = text
+        obj = jload(text)
+        if not isinstance(obj, dict):
+            r["err"] = "响应不是 JSON（http=%s）" % st
+            return r
+        if st != 200 or obj.get("code") not in (0, None):
+            r["err"] = "http=%s code=%s msg=%s" % (st, obj.get("code"), obj.get("msg"))
+            return r
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            r["err"] = "data 不是对象"
+            return r
+        # 前端读的是 data.streak.* 与 data.makeup_cards.*
+        sk = data.get("streak") if isinstance(data.get("streak"), dict) else data
+        if isinstance(sk, dict):
+            if sk.get("days") is not None:
+                try:
+                    r["days"] = int(sk["days"])
+                except (TypeError, ValueError):
+                    pass
+            nt = sk.get("next_tier")
+            r["next_tier"] = nt if isinstance(nt, str) else None
+            md = sk.get("makeup_dates")
+            r["makeup_dates"] = md if isinstance(md, list) else []
+        mc = data.get("makeup_cards")
+        if isinstance(mc, dict):
+            for key in ("balance", "max"):
+                if mc.get(key) is not None:
+                    try:
+                        r["makeup_cards"][key] = int(mc[key])
+                    except (TypeError, ValueError):
+                        pass
+        rs = data.get("redemption_status")
+        if isinstance(rs, dict):
+            tiers = rs.get("tiers")
+            if isinstance(tiers, list):
+                r["redeem_status"] = {"tiers": tiers}
+            elif isinstance(tiers, dict):
+                r["redeem_status"] = {"tiers": tiers}
+        r["ok"] = True
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def get_redeem_summary(token, uid):
+    """读连登奖励兑换汇总（本月每档已兑几次）。只读。"""
+    r = {"ok": False, "http": 0, "err": None, "counts": {}, "raw_body": ""}
+    try:
+        st, text = call("GET", HOST_ACTIVITY + "/v2/activity/growth/redeem/summary", token, uid)
+        r["http"] = st
+        r["raw_body"] = text
+        obj = jload(text)
+        if not isinstance(obj, dict):
+            r["err"] = "响应不是 JSON（http=%s）" % st
+            return r
+        if st != 200 or obj.get("code") not in (0, None):
+            r["err"] = "http=%s code=%s msg=%s" % (st, obj.get("code"), obj.get("msg"))
+            return r
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        # 前端字段：starter_count / advanced_count / legendary_count
+        for key, _name, _tier in STREAK_TIERS:
+            v = data.get(key + "_count")
+            if v is not None:
+                try:
+                    r["counts"][key] = int(v)
+                except (TypeError, ValueError):
+                    pass
+        r["ok"] = True
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def growth_flow(token, uid, log, enabled=True):
+    """连登/成长只读采集。任何异常都吞掉，绝不影响签到结论（与派猫同样的隔离纪律）。
+
+    阶段 A 只读：GET status + GET redeem/summary，不发起任何写操作。
+    """
+    r = {"ok": True, "err": None, "enabled": bool(enabled),
+         "streak": None, "redeem": None}
+    if not enabled:
+        r["err"] = "已按 WB_GROWTH=0 跳过"
+        return r
+    try:
+        sk = get_streak(token, uid)
+        log.append(("读连续登录 growth/streak", sk.get("http"), sk.get("raw_body") or ""))
+        r["streak"] = sk
+        rs = get_redeem_summary(token, uid)
+        log.append(("读兑换汇总 growth/redeem/summary", rs.get("http"), rs.get("raw_body") or ""))
+        r["redeem"] = rs
+        if not sk.get("ok") and not rs.get("ok"):
+            r["ok"] = False
+            r["err"] = "streak=%s / redeem=%s" % (sk.get("err"), rs.get("err"))
+    except Exception as e:
+        r["ok"] = False
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
 # ---------------------------------------------------------------- 报告
 def fmt_ts(ts):
     try:
@@ -694,6 +844,19 @@ def do_account(acc, args, idx, total):
         if not cat.get("ok"):
             print("猫猫异常（不影响签到结论）: %s" % cat.get("err"))
 
+    # 连登/成长：放在最后，纯只读。即使整段出错也绝不影响签到与派猫的既有结论。
+    growth = growth_flow(token, uid, log, enabled=args.growth)
+    if args.growth:
+        sk = growth.get("streak") or {}
+        rs = growth.get("redeem") or {}
+        print("连登: 当前 %s 天，下一档 %s，补登卡 %s/%s"
+              % (sk.get("days"), sk.get("next_tier") or "已达最高档",
+                 sk.get("makeup_cards", {}).get("balance"),
+                 sk.get("makeup_cards", {}).get("max")))
+        print("      本月已兑: %s" % (rs.get("counts") or "—"))
+        if not growth.get("ok"):
+            print("连登读取异常（不影响签到结论）: %s" % growth.get("err"))
+
     return {
         "name": acc["name"],
         "uid": uid,
@@ -706,6 +869,7 @@ def do_account(acc, args, idx, total):
         "buy": buy,
         "rw": rw,
         "cat": cat,
+        "growth": growth,
         "log": log,
     }
 
@@ -750,6 +914,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="只读，不领取/不派出")
     ap.add_argument("--no-cat", action="store_true", help="跳过派猫")
+    ap.add_argument("--no-growth", dest="growth", action="store_false",
+                    default=_env_on("WB_GROWTH", True),
+                    help="跳过连登/成长采集（等价于 WB_GROWTH=0）")
     ap.add_argument("--location-id", type=int, default=LOCATION_DEFAULT)
     ap.add_argument("--report", default="report_single.html",
                     help="单次运行报告路径（默认在 DATA_DIR 下）")
