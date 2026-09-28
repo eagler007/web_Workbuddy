@@ -1,0 +1,40 @@
+# 构建上下文排除项 —— 别把这些打进镜像
+.env
+.env.*
+!.env.example
+
+# 数据与产物（都在宿主卷里，不进镜像）
+data/
+*.html
+*.log
+wb_daily_report.html
+wb_daily_raw.log
+
+# 开发残留 / 诊断
+_diag/
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+.git/
+.gitignore
+
+# 文档与设计稿（镜像里不需要）
+*.md
+!README.md
+
+# 与本容器无关的旧脚本
+wb_creds.py
+build_qd_tpl.py
+force_save_tpl.py
+make_qd_task.py
+_run_task.py
+run_wb_daily.sh
+run_wb_report.sh
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
