@@ -35,9 +35,8 @@ docker compose up -d
 docker compose logs -f --tail=50
 ```
 
-打开 **http://192.168.2.12:18080/** → 输 `WEB_PASSWORD` → 「账号」页加账号。
+打开 **http://localhost:18080/** → 输 `WEB_PASSWORD` → 「账号」页加账号。
 
-> 端口说明：宿主的 `8080` 在你这台机器上已被占用，所以映射用的 **18080 → 容器 8080**。
 > 要换端口就改 `docker-compose.yml` 里的 `ports`。
 
 ---
@@ -73,7 +72,6 @@ workbuddy 容器
 文件里 `auth.accessToken` 是 token，`account.uid` 是 uid。
 
 > 新版本把这个文件加密了（值形如 `{"$wbEncrypted":1,"envelope":"..."}`），
-> 明文只在**老版本**里能直接读。加密版建议从别处取：
 > 浏览器 F12 → Network → 任一接口请求头里的 `Authorization: Bearer ...` 和 `X-User-Id`。
 
 Token 有效期约 60 天，过期后签到会返回 401 —— 到「账号」页用同一个 UID 重新提交一次新 token 即可（不用删了重建）。
