@@ -264,13 +264,29 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 | 兑换汇总 | `GET  https://www.workbuddy.cn/v2/activity/growth/redeem/summary` |
 | 兑换连登奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/redeem`，body `{"tier":"…","client_token":"…"}` |
 | 用补登卡 | `POST https://www.workbuddy.cn/v2/activity/growth/makeup-cards/use`，body `{"target_date":"YYYY-MM-DD"}` |
-| **每日用量** | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-daily-usage`，body `{"startTime":"YYYY-MM-DD 00:00:00","endTime":"YYYY-MM-DD 23:59:59","pageNum":1,"pageSize":100}` |
-| 请求级明细 | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-request-usage`，参数同上 |
+| **每日用量** | `POST https://www.codebuddy.cn/billing/meter/get-user-daily-usage`，body `{"startTime":"YYYY-MM-DD 00:00:00","endTime":"YYYY-MM-DD 23:59:59","pageNum":1,"pageSize":100}` |
+| 请求级明细 | `POST https://www.codebuddy.cn/billing/meter/get-user-request-usage`，参数同上 |
+| 资源汇总 | `POST https://www.codebuddy.cn/billing/meter/get-user-resource-summary`，参数同上 |
 | 猫猫状态 | `GET  https://www.workbuddy.cn/v2/activity/growth/buddy/travel/status` |
 | 领奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/claim` |
 | 派出去 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/depart` |
 
 认证头：`Authorization: Bearer <token>` + `X-User-Id: <uid>`。
+
+> ⚠️ **前缀陷阱（踩过坑，务必看清）**：同一组 `/billing/meter/*` 接口，**前缀并不统一**：
+>
+> | 接口 | 前缀 |
+> |---|---|
+> | `get-user-resource`（查余额） | **带** `/v2` |
+> | `daily-checkin`（签到） | **带** `/v2` |
+> | `get-user-daily-usage`（每日用量） | **不带** `/v2` |
+> | `get-user-request-usage` | **不带** `/v2` |
+> | `get-user-resource-summary` | **不带** `/v2` |
+>
+> **症状怎么分**：`404` = 路径不存在（前缀写错）；`401` = 路径对、凭据无效。
+> 先前用量一直报 `http=404`，就是照抄了 `get-user-resource` 的 `/v2`。
+> 代码侧已加**前缀自适应兜底**（`usage.py` 的 `_call_with_prefix_fallback`：首选不带 `/v2`，
+> 若 404 自动改试另一种并记住），所以即便以后官方又挪前缀，也不会再直接 404。
 
 > 这些接口名不是猜的，是从产品自己的前端包里挖出来的：
 > - 连登/派猫 → `growthSpace-CCYzF8bt.js`（仅 3.3 KB，整组 API 常量写死）
@@ -325,7 +341,7 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 **口径要说清楚**：CodeBuddy 采用**积分计费**，模型调用按系数扣积分 ——
 所以这里统计的是**积分消耗**，不是原始 token 数。接口字段就叫 `credit`。
 
-数据来自 `POST /v2/billing/meter/get-user-daily-usage`，
+数据来自 `POST /billing/meter/get-user-daily-usage`（**不带 `/v2`**，写成 `/v2/...` 会 404），
 由 `wb_daily.py` 的 `usage_flow()` 采集，写进归档的 `usage_today` / `usage_days` /
 `usage_sum` / `usage_range` 字段，报告侧纯离线渲染（不联网）。
 

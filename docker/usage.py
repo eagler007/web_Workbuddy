@@ -8,13 +8,23 @@
 顺着「用量明细」文案挖出来的。请求体字段名是 **startTime/endTime**（驼峰），
 别和 get-user-resource 那套 SlicePeriodStartTime/PackageCodes 混了 —— 那是另一个接口。
 
-    POST /v2/billing/meter/get-user-daily-usage
-         body {"startTime":"YYYY-MM-DD 00:00:00",
-               "endTime":"YYYY-MM-DD 23:59:59",
-               "pageNum":1,"pageSize":N}
-         resp data.data.data[] = [{"date":"YYYY-MM-DD","credit":<消耗>}, ...]
-              data.data.total  = 总条数
-    POST /v2/billing/meter/get-user-request-usage   请求级明细，同上参数
+⚠️ **前缀陷阱（2026-09-28 实测确认）**：同一批 `/billing/meter/*` 接口里，
+**只有「查余额 / 签到」带 `/v2` 前缀，「用量」三个接口不带**：
+
+    POST /v2/billing/meter/get-user-resource        ← 带 /v2 ✅（签到/余额用）
+    POST /v2/billing/meter/daily-checkin            ← 带 /v2 ✅
+    POST /billing/meter/get-user-daily-usage        ← **不带 /v2** ✅
+    POST /billing/meter/get-user-request-usage      ← **不带 /v2** ✅
+    POST /billing/meter/get-user-resource-summary   ← **不带 /v2** ✅
+
+带错的症状就是 **HTTP 404**（路径不存在；不是 401，401 才是凭据问题）。
+用 `curl -X POST` 空 body 探一下就能区分：404=路径错，401=路径对但没凭据。
+
+    请求体 {"startTime":"YYYY-MM-DD 00:00:00",
+            "endTime":"YYYY-MM-DD 23:59:59",
+            "pageNum":1,"pageSize":N}
+    响应   data.data.data[] = [{"date":"YYYY-MM-DD","credit":<消耗>}, ...]
+           data.data.total  = 总条数
 
 业务要点（前端文案原文）：
   - 「CodeBuddy 插件、IDE、Code 采用积分计费模式，模型调用根据系数自动扣除积分。」
@@ -36,6 +46,11 @@ HOST_BILLING = "https://www.codebuddy.cn"    # 积分/用量接口
 TIMEOUT = 20
 USAGE_MAX_DAYS = 31        # 前端 hard limit，照抄
 USAGE_DEFAULT_DAYS = 7     # 前端默认窗口
+
+# ⚠️ 用量接口**不带** /v2 前缀（查余额/签到那条才带）。见文件头说明。
+PATH_DAILY_USAGE = "/billing/meter/get-user-daily-usage"
+PATH_REQUEST_USAGE = "/billing/meter/get-user-request-usage"
+PATH_RESOURCE_SUMMARY = "/billing/meter/get-user-resource-summary"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) WorkBuddy-Usage/1.0")
@@ -78,6 +93,45 @@ def _call(method, url, token, uid, body=None, timeout=TIMEOUT):
         return 0, "URLError: %s" % e
 
 
+def _call_with_prefix_fallback(path, token, uid, body, timeout=TIMEOUT, caller=None):
+    """按 `path` 请求；**若 404 则自动试一次带/不带 /v2 的另一种前缀**。
+
+    2026-09-28 踩过：用量接口不带 /v2，而查余额/签到那条带 /v2 —— 前缀不统一。
+    写死一个前缀，服务端一改就全挂（症状是 404）。这里做个自适应：
+    首选 `path`，404 时换另一种前缀再试一次；第二次成功就沿用（记住），
+    这样即使服务端调整也不会再断。
+
+    caller：可注入的 HTTP 函数 `(method, url, token, uid, body, timeout) -> (status, text)`。
+    默认用本模块的 `_call`。传进来是为了让上层（如 wb_daily）的桩函数继续生效。
+
+    返回 (status, text, used_path)。永不抛异常。
+    """
+    global _PREFIX_PREF
+    fn = caller or _call
+    cand = [path]
+    alt = ("/v2" + path) if not path.startswith("/v2") else path[3:]
+    if alt and alt != path:
+        cand.append(alt)
+    # 之前学到过偏好 → 把它提到最前。
+    # ⚠️ 别在 sort 的 key 里调 cand.index()：排序过程中列表会被就地改动，
+    #    ValueError: ... is not in list（2026-09-28 踩过）。
+    if _PREFIX_PREF in cand:
+        cand = [_PREFIX_PREF] + [p for p in cand if p != _PREFIX_PREF]
+    last = (0, "", path)
+    for i, p in enumerate(cand):
+        st, text = fn("POST", HOST_BILLING + p, token, uid, body, timeout)
+        if st != 404:                    # 通了（哪怕是 401/500）就是对的路径
+            if i > 0:                    # 换了前缀才通 → 记住它
+                _PREFIX_PREF = p
+            return st, text, p
+        last = (st, text, p)
+    return last
+
+
+# 学到过的正确前缀（进程级）。None 表示还不知道。
+_PREFIX_PREF = None
+
+
 def _jload(text):
     try:
         return json.loads(text)
@@ -94,22 +148,25 @@ def usage_range(days):
 
 
 # ---------------------------------------------------------------- 主查询
-def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT):
+def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller=None):
     """读每日积分/用量。返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。
 
     返回字段：
-      ok/http/err/raw_body/range[起,止]/total/days[{date,credit}]/sum/today
+      ok/http/err/raw_body/range[起,止]/total/days[{date,credit}]/sum/today/path
+
+    caller：可选，注入的 HTTP 函数（见 _call_with_prefix_fallback）。
     """
     r = {"ok": False, "http": 0, "err": None, "days": [], "total": None,
-         "today": None, "sum": None, "raw_body": "", "range": None}
+         "today": None, "sum": None, "raw_body": "", "range": None, "path": None}
     try:
         st_t, en_t = usage_range(days)
         r["range"] = [st_t[:10], en_t[:10]]
         body = {"startTime": st_t, "endTime": en_t, "pageNum": 1, "pageSize": 100}
-        st, text = _call("POST", HOST_BILLING + "/v2/billing/meter/get-user-daily-usage",
-                         token, uid, body, timeout=timeout)
+        st, text, used = _call_with_prefix_fallback(
+            PATH_DAILY_USAGE, token, uid, body, timeout=timeout, caller=caller)
         r["http"] = st
         r["raw_body"] = text
+        r["path"] = used
         obj = _jload(text)
         if not isinstance(obj, dict):
             r["err"] = "响应不是 JSON（http=%s）" % st
@@ -117,6 +174,8 @@ def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT):
         if st != 200 or obj.get("code") not in (0, None):
             r["err"] = "http=%s code=%s msg=%s" % (
                 st, obj.get("code"), obj.get("msg") or obj.get("message"))
+            if st == 404:
+                r["err"] += "（路径 %s 不存在 —— 检查前缀是否该带/不该带 /v2）" % used
             return r
         # ⚠️ 双层 data：data.data.data 才是数组（前端写的是 E.data.data.data）。
         #    但网关偶尔会少一层，所以逐层判空、能取到就用。

@@ -1079,7 +1079,8 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
     body += """<div class="panel"><h3>口径说明</h3><div class="sub" style="padding:0 16px 16px">
 <strong>这里查的是「积分消耗」，不是原始 token 数。</strong>CodeBuddy 采用积分计费，
 模型调用按系数自动扣除积分。<br>
-接口：<code>POST /v2/billing/meter/get-user-daily-usage</code>；
+接口：<code>POST /billing/meter/get-user-daily-usage</code>（注意**不带 /v2**，
+查余额那条才带 —— 写错前缀会 404）；
 数据存在 <strong>2–3 小时延迟</strong>，当天为 0 或为空是正常的，不代表没消耗。<br>
 窗口上限 31 天（前端硬限制）。可在「设置」区调默认窗口
 <code>WB_USAGE_DAYS</code>。

@@ -802,17 +802,26 @@ def growth_flow(token, uid, log, enabled=True, redeem=False):
 
 
 # ---------------------------------------------------------------- Token / 积分用量
+# ⚠️ 真实实现已收敛到 usage.py（单一来源），这里只留常量和薄封装。
+#    历史上这里有一份重复实现，两处都要改容易漏 —— 现在只改 usage.py。
+#
 # 接口来源：www.workbuddy.cn 主包 index-BTO2lsRd.js（786 KB）里内联的用量页代码，
 # 顺着「用量明细」文案挖出来的。请求体字段名是 **startTime/endTime**（驼峰），
 # 别和 get-user-resource 那套 SlicePeriodStartTime/PackageCodes 混了 —— 那是另一个接口。
 #
-#   POST /v2/billing/meter/get-user-daily-usage
+# ⚠️ **前缀陷阱（2026-09-28 实测）**：用量接口**不带 /v2**，查余额/签到那条**带 /v2**：
+#       POST /v2/billing/meter/get-user-resource      ← 带 ✅
+#       POST /v2/billing/meter/daily-checkin          ← 带 ✅
+#       POST /billing/meter/get-user-daily-usage      ← **不带** ✅
+#    带错前缀的症状是 **HTTP 404**（路径不存在）。401 才是凭据问题，别混。
+#
+#   POST /billing/meter/get-user-daily-usage
 #        body {"startTime":"YYYY-MM-DD 00:00:00",
 #              "endTime":"YYYY-MM-DD 23:59:59",
 #              "pageNum":1,"pageSize":N}
 #        resp data.data.data[] = [{"date":"YYYY-MM-DD","credit":<消耗>}, ...]
 #             data.data.total  = 总条数
-#   POST /v2/billing/meter/get-user-request-usage   请求级明细，同上参数
+#   POST /billing/meter/get-user-request-usage   请求级明细，同上参数
 #
 # 业务要点（前端文案原文）：
 #   - 「CodeBuddy 插件、IDE、Code 采用积分计费模式，模型调用根据系数自动扣除积分。」
@@ -833,14 +842,38 @@ def _usage_range(days):
 
 
 def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS):
-    """读每日积分/用量。返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。"""
+    """读每日积分/用量。返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。
+
+    ⚠️ 实现已收敛到 usage.py（单一来源），这里只是薄封装，保证老调用点不变。
+    历史上这里有一份重复实现，两处都要改容易漏 —— 现在只改 usage.py。
+
+    这里把本模块的 `call` **注入**给 usage.py，好处有两点：
+      ① 测试里打桩 `wb.call` 依然生效（老测试不用改）；
+      ② 沿用本模块的 UA/超时等既有行为，不引入第二套 HTTP 逻辑。
+    """
+    try:
+        import usage as _u
+
+        def _caller(method, url, token_, uid_, body_, timeout_=TIMEOUT):
+            return call(method, url, token_, uid_, body_, timeout=timeout_)
+
+        return _u.get_daily_usage(token, uid, days=days, timeout=TIMEOUT,
+                                  caller=_caller)
+    except Exception as e:
+        return {"ok": False, "http": 0, "err": "%s: %s" % (type(e).__name__, e),
+                "days": [], "total": None, "today": None, "sum": None,
+                "raw_body": "", "range": None, "path": None}
+
+
+def _get_daily_usage_legacy(token, uid, days=USAGE_DEFAULT_DAYS):
+    """旧实现（保留做参考，不再被调用）。注意路径**不带 /v2**。"""
     r = {"ok": False, "http": 0, "err": None, "days": [], "total": None,
          "today": None, "sum": None, "raw_body": "", "range": None}
     try:
         st_t, en_t = _usage_range(days)
         r["range"] = [st_t[:10], en_t[:10]]
         body = {"startTime": st_t, "endTime": en_t, "pageNum": 1, "pageSize": 100}
-        st, text = call("POST", HOST_BILLING + "/v2/billing/meter/get-user-daily-usage",
+        st, text = call("POST", HOST_BILLING + "/billing/meter/get-user-daily-usage",
                         token, uid, body)
         r["http"] = st
         r["raw_body"] = text
