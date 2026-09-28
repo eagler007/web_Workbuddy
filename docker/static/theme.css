@@ -275,6 +275,57 @@ svg.spark { display: block; overflow: visible; }
   display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px;
 }
 
+/* ---------------------------------------------------------------- 用量看板
+   版式参考本机「Token 消耗看板」技能：KPI 横排 + 卡片区块。
+   所有颜色走变量，深色模式自动换。 */
+.kpis {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px; margin-bottom: 16px;
+}
+.kpi {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 13px 15px; min-width: 0;
+  box-shadow: var(--shadow);
+}
+.kpi .k {
+  font-size: 11.5px; color: var(--mut); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.kpi .v {
+  font-size: 22px; font-weight: 700; color: var(--fg); margin-top: 5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.kpi .s { font-size: 11px; color: var(--mut2); margin-top: 2px; }
+
+/* 窗口切换小药丸 */
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  display: inline-block; padding: 5px 12px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--card2);
+  color: var(--mut); font-size: 12.5px; text-decoration: none;
+  cursor: pointer; line-height: 1.5;
+}
+.chip:hover { color: var(--fg); border-color: var(--acc); }
+.chip.on {
+  background: var(--acc); border-color: var(--acc);
+  color: var(--acc-fg); font-weight: 600;
+}
+
+/* 每账号一块迷你柱状图 */
+.upanel { padding: 10px 16px 4px; border-top: 1px solid var(--line); }
+.upanel:first-of-type { border-top: none; }
+.upanel .uhead {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 13px; font-weight: 600; color: var(--fg); margin-bottom: 6px;
+  gap: 10px; flex-wrap: wrap;
+}
+.upanel .usum { font-size: 11.5px; color: var(--mut); font-weight: 400; }
+
+/* 窄屏：KPI 折行 */
+@media (max-width: 720px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 /* 打印：强制浅色，省墨 */
 @media print {
   html[data-theme] { --bg: #fff; --card: #fff; }

@@ -67,6 +67,7 @@ MAX_BODY = 256 * 1024                # 请求体上限
 
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "wb_accounts.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "wb_history.json")
+USAGE_HISTORY_FILE = os.path.join(DATA_DIR, "usage_history.json")
 REPORT_FILE = os.path.join(DATA_DIR, "report.html")
 SINGLE_REPORT = os.path.join(DATA_DIR, "report_single.html")
 RAW_LOG = os.path.join(DATA_DIR, "wb_daily_raw.log")
@@ -80,6 +81,16 @@ TIMEOUT = 25
 
 ACC_LOCK = threading.RLock()          # 保护 wb_accounts.json 的读写
 RUN_LOCK = threading.Lock()           # 同时只允许一个手动任务在跑
+
+# 用量查询短缓存：{天数: {"ts":.., "rows":.., "err":..}}。
+# 目的是「同一窗口内多次刷新不打爆接口」，不是长期存储。
+# TTL 可调：WB_USAGE_CACHE_TTL（秒），最小 5。
+try:
+    USAGE_CACHE_TTL = max(5, int(os.environ.get("WB_USAGE_CACHE_TTL") or 60))
+except Exception:
+    USAGE_CACHE_TTL = 60
+_USAGE_CACHE = {}
+_USAGE_LOCK = threading.Lock()
 
 # 手动跑的进度状态（内存态，重启丢失，够用）
 JOB = {"running": False, "kind": "", "started": 0.0, "ended": 0.0,
@@ -405,8 +416,8 @@ THEME_BTN = ('<button type="button" class="themebtn" id="wb-theme-btn" '
 
 
 def page(title, body, on="", msg="", nonce="", extra_head="", extra_body=""):
-    nav = [("/", "总览"), ("/accounts", "账号"), ("/report", "报告"),
-           ("/logs", "日志"), ("/update", "更新")]
+    nav = [("/", "总览"), ("/accounts", "账号"), ("/usage", "用量"),
+           ("/report", "报告"), ("/logs", "日志"), ("/update", "更新")]
     links = "".join('<a href="%s"%s>%s</a>' %
                     (h, ' class="on"' if h == on else "", t) for h, t in nav)
     m = ""
@@ -772,6 +783,315 @@ def view_update(msg="", nonce="", info=None):
     return page("更新", body, on="/update", msg=msg, nonce=nonce)
 
 
+# ---------------------------------------------------------------- 用量看板
+# 视觉语言参考本机「Token 消耗看板」技能（KPI 横排 + 卡片区块 + 深浅色），
+# 但数据源不同：那边读本机请求级日志，这里走**真实接口**查账号级积分消耗。
+USAGE_DEFAULT_VIEW_DAYS = 7
+
+
+def _usage_rows_cached(days, force=False):
+    """带短缓存的用量查询，避免每次刷新都打接口。
+
+    缓存键含天数；TTL 内直接复用。整体 try/except，失败返回 (rows, err)。
+    """
+    days = max(1, min(int(days or USAGE_DEFAULT_VIEW_DAYS), 31))
+    now = time.time()
+    with _USAGE_LOCK:
+        c = _USAGE_CACHE.get(days)
+        if c and not force and (now - c["ts"]) < USAGE_CACHE_TTL:
+            return c["rows"], c["err"], c["ts"], True
+    rows, err = [], None
+    try:
+        import usage as _u
+        accs = load_accounts()
+        rows = _u.query_accounts(accs, days=days)
+    except Exception as e:
+        err = "%s: %s" % (type(e).__name__, e)
+    with _USAGE_LOCK:
+        _USAGE_CACHE[days] = {"ts": now, "rows": rows, "err": err}
+    return rows, err, now, False
+
+
+def load_usage_history():
+    """读定时采集落下的用量归档。读不到就返回空壳，绝不抛异常。
+
+    结构见 collect_usage.py 头部说明。**文件里不含任何凭据**。
+    """
+    if not os.path.isfile(USAGE_HISTORY_FILE):
+        return {"version": 1, "updated": "", "days": 0, "by_date": {}}
+    try:
+        with open(USAGE_HISTORY_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict) or not isinstance(d.get("by_date"), dict):
+            return {"version": 1, "updated": "", "days": 0, "by_date": {}}
+        return d
+    except Exception:
+        return {"version": 1, "updated": "", "days": 0, "by_date": {}}
+
+
+def _bars_svg(pairs, w=560, h=120, gap=4):
+    """轻量柱状图：pairs = [(label, value), ...]。色值全走主题变量。"""
+    vals = [float(v or 0) for _, v in pairs]
+    if not vals:
+        return ""
+    mx = max(vals) or 1.0
+    n = len(pairs)
+    bw = max(2.0, (w - gap * (n - 1)) / float(n))
+    parts = []
+    for i, (lab, v) in enumerate(pairs):
+        v = float(v or 0)
+        bh = (v / mx) * (h - 18)
+        if bh < 1 and v > 0:
+            bh = 1
+        x = i * (bw + gap)
+        y = h - 16 - bh
+        parts.append(
+            '<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" rx="2" '
+            'fill="var(--chart-bar)"><title>%s：%.2f</title></rect>'
+            % (x, y, bw, bh, html.escape(str(lab)), v))
+    return ('<svg class="spark" viewBox="0 0 %d %d" preserveAspectRatio="none" '
+            'style="width:100%%;height:%dpx">%s</svg>' % (w, h, h, "".join(parts)))
+
+
+def _line_svg(dates, per_day, w=560, h=150):
+    """轻量折线图（含面积）。全走主题变量。"""
+    if not dates:
+        return ""
+    vals = [float(per_day.get(d) or 0) for d in dates]
+    mx = max(vals) or 1.0
+    n = len(dates)
+    pad_l, pad_r, pad_t, pad_b = 6, 6, 10, 20
+    iw = w - pad_l - pad_r
+    ih = h - pad_t - pad_b
+    pts = []
+    for i, v in enumerate(vals):
+        x = pad_l + (iw * i / (n - 1) if n > 1 else iw / 2.0)
+        y = pad_t + ih - (v / mx) * ih
+        pts.append((x, y))
+    line = " ".join("%.2f,%.2f" % p for p in pts)
+    area = ("%.2f,%.2f " % (pad_l, pad_t + ih)) + line + \
+           (" %.2f,%.2f" % (pad_l + iw, pad_t + ih))
+    # 只标首、中、末三个日期，避免挤在一起
+    marks = ""
+    if n:
+        idxs = sorted(set([0, n // 2, n - 1]))
+        for i in idxs:
+            x = pts[i][0]
+            marks += ('<text x="%.2f" y="%d" font-size="9" fill="var(--mut2)" '
+                      'text-anchor="middle">%s</text>'
+                      % (x, h - 6, html.escape(dates[i][5:])))
+    return ('<svg viewBox="0 0 %d %d" style="width:100%%;height:%dpx">'
+            '<polygon points="%s" fill="var(--spark-lo)" opacity=".35"/>'
+            '<polyline points="%s" fill="none" stroke="var(--chart-line)" '
+            'stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
+            '%s</svg>' % (w, h, h, area, line, marks))
+
+
+def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached=False):
+    """用量看板：自动请求真实接口，展示每个账号的积分消耗。"""
+    try:
+        days = max(1, min(int(days or os.environ.get("WB_USAGE_DAYS")
+                              or USAGE_DEFAULT_VIEW_DAYS), 31))
+    except Exception:
+        days = USAGE_DEFAULT_VIEW_DAYS
+    if rows is None:
+        rows, err, ts, cached = _usage_rows_cached(days)
+
+    ok_rows = [r for r in rows if r.get("ok")]
+    n_ok, n_all = len(ok_rows), len(rows)
+    total_sum = None
+    try:
+        import usage as _u
+        _k, _per, total_sum = _u.merge_rows(ok_rows)
+    except Exception:
+        _k, _per = [], {}
+
+    today_sum = 0.0
+    have_today = False
+    for r in ok_rows:
+        if r.get("today") is not None:
+            today_sum += float(r["today"])
+            have_today = True
+
+    # ---- KPI 横排（照 token-dashboard 的版式）
+    def _kpi(k, v, s=""):
+        return ('<div class="kpi"><div class="k">%s</div><div class="v">%s</div>'
+                '<div class="s">%s</div></div>'
+                % (html.escape(k), v, html.escape(s)))
+
+    kpis = [
+        _kpi("今日消耗", ("%.2f" % today_sum) if have_today else "—", "积分"),
+        _kpi("%d 天合计" % days, ("%.2f" % total_sum) if total_sum is not None else "—",
+             "积分"),
+        _kpi("日均", ("%.2f" % (total_sum / days)) if total_sum else "0.00", "积分/天"),
+        _kpi("账号数", "%d / %d" % (n_ok, n_all), "可用 / 总数"),
+        _kpi("查询窗口", "%d 天" % days, "上限 31"),
+    ]
+    body = '<div class="kpis">%s</div>' % "".join(kpis)
+
+    # ---- 窗口切换 + 刷新
+    chips = ""
+    for d in (1, 3, 7, 14, 30):
+        chips += ('<a class="chip%s" href="/usage?days=%d">%d 天</a>'
+                  % (" on" if d == days else "", d, d))
+    body += """<div class="panel"><h3>查询窗口</h3>
+<div class="actions" style="padding:6px 16px 14px">
+<div class="chips">%s</div>
+<form method="post" action="/usage/refresh" style="margin-left:auto">
+<input type="hidden" name="csrf" value="%s"><input type="hidden" name="days" value="%d">
+<button type="submit" class="ghost">重新查询</button></form>
+</div>
+<div class="sub" style="padding:0 16px 14px">每次打开本页会<strong>自动请求真实接口</strong>拉取账号级积分消耗
+（同一窗口 %d 秒内复用缓存）。点「重新查询」强制刷新。</div></div>""" % (
+        chips, nonce, days, USAGE_CACHE_TTL)
+
+    if err:
+        body += '<div class="msg bad">查询出错：%s</div>' % html.escape(str(err))
+
+    if not rows:
+        body += ('<div class="panel"><h3>还没有账号</h3>'
+                 '<p class="trim">先去「账号」页添加账号，本页才能查到消耗。</p></div>')
+        return page("用量", body, on="/usage", msg=msg, nonce=nonce)
+
+    # ---- 总走势
+    try:
+        import usage as _u2
+        dates = sorted(_per.keys())
+        per_day = _per
+    except Exception:
+        dates, per_day = [], {}
+    if dates:
+        body += ('<div class="panel"><h3>每日总消耗走势</h3>'
+                 '<div style="padding:4px 16px 16px">%s</div></div>'
+                 % _line_svg(dates, per_day))
+    else:
+        body += ('<div class="panel"><h3>每日总消耗走势</h3>'
+                 '<p class="trim">接口没返回带日期的记录。'
+                 '用量数据有 2–3 小时延迟，当天为空属正常。</p></div>')
+
+    # ---- 账号明细
+    trs = ""
+    for r in rows:
+        if not r.get("ok"):
+            trs += ('<tr><td class="acc">%s</td>'
+                    '<td><span class="st bad">失败</span></td>'
+                    '<td class="mut">—</td><td class="mut">—</td>'
+                    '<td class="mono" style="font-size:12px">%s</td>'
+                    '<td class="uerr" style="padding:0;font-size:11.5px">%s</td></tr>'
+                    % (html.escape(r.get("name") or "-"),
+                       html.escape(r.get("uid_masked") or "-"),
+                       html.escape(str(r.get("err") or "查询失败")[:80])))
+            continue
+        t = r.get("today")
+        t_html = ('<b>%.2f</b>' % float(t)) if t is not None else '<span class="mut">—</span>'
+        s = r.get("sum")
+        s_html = ('%.2f' % float(s)) if s is not None else '<span class="mut">—</span>'
+        rng = r.get("range") or []
+        trs += ('<tr><td class="acc">%s</td>'
+                '<td><span class="st ok">正常</span></td>'
+                '<td class="credit">%s</td><td>%s</td>'
+                '<td class="mono" style="font-size:12px">%s</td>'
+                '<td class="mut" style="font-size:12px">%s</td></tr>'
+                % (html.escape(r.get("name") or "-"), t_html, s_html,
+                   html.escape("%s → %s" % (rng[0], rng[1]) if len(rng) == 2 else "—"),
+                   html.escape(r.get("uid_masked") or "-")))
+    body += ('<div class="panel"><h3>账号明细</h3><div class="scroll"><table>'
+             '<tr><th>账号</th><th>状态</th><th>今日</th><th>%d 天合计</th>'
+             '<th>窗口</th><th>UID</th></tr>%s</table></div></div>' % (days, trs))
+
+    # ---- 每个可用账号的迷你走势
+    mini = ""
+    for r in ok_rows:
+        try:
+            import usage as _u3
+            g = _u3.fill_gaps(r.get("days") or [], n=days)
+        except Exception:
+            g = []
+        if not g:
+            continue
+        pairs = [(it["date"], it.get("credit") or 0) for it in g]
+        mini += ('<div class="upanel"><div class="uhead">%s'
+                 '<span class="usum">%s 天合计 %s</span></div>%s</div>'
+                 % (html.escape(r.get("name") or "-"),
+                    days,
+                    ("%.2f" % float(r["sum"])) if r.get("sum") is not None else "—",
+                    _bars_svg(pairs)))
+    if mini:
+        body += '<div class="panel"><h3>各账号每日消耗</h3>%s</div>' % mini
+
+    # ---- 定时采集历史（每天早上跑的那一轮）
+    hist = load_usage_history()
+    hbd = hist.get("by_date") or {}
+    if hbd:
+        hkeys = sorted(hbd.keys())[-14:]
+        # 名称集合（按采集记录里出现过的账号）
+        names, seen = [], set()
+        for k in reversed(hkeys):
+            for a in (hbd[k].get("accounts") or []):
+                nm = a.get("name") or "-"
+                if nm not in seen:
+                    seen.add(nm)
+                    names.append(nm)
+        ths = "".join("<th>%s</th>" % html.escape(n) for n in names)
+        trs2 = ""
+        for k in reversed(hkeys):
+            rec = hbd[k]
+            cellmap = {}
+            for a in (rec.get("accounts") or []):
+                cellmap[a.get("name") or "-"] = a
+            tds = ""
+            for n in names:
+                a = cellmap.get(n)
+                if a is None:
+                    tds += '<td class="na">·</td>'
+                elif not a.get("ok"):
+                    tds += '<td><span class="st bad" title="%s">失败</span></td>' % \
+                        html.escape(str(a.get("err") or "")[:60])
+                else:
+                    t = a.get("today")
+                    tds += ('<td class="credit">%s</td>'
+                            % (("%.2f" % float(t)) if t is not None
+                               else '<span class="mut">—</span>'))
+            trs2 += ('<tr><td class="acc">%s</td><td class="mut" '
+                     'style="font-size:11.5px">%s</td>%s</tr>'
+                     % (html.escape(k), html.escape(str(rec.get("ts") or "")[11:16]),
+                        tds))
+        body += ('<div class="panel"><h3>定时采集历史</h3>'
+                 '<div class="sub">容器里每天 <code>%s</code> 自动跑一次用量采集'
+                 '（cron：<code>%s</code>），下表是每次采到的「当日消耗」。'
+                 '格子里是积分，<span class="st bad">失败</span>表示那次没查通。</div>'
+                 '<div class="scroll"><table><tr><th>日期</th><th>时间</th>%s</tr>%s'
+                 '</table></div>'
+                 '<p class="hint" style="padding:0 16px 14px">最近更新 %s · 共 %d 天记录'
+                 '（保留最近 180 天）</p></div>'
+                 % (html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *"),
+                    html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *"),
+                    ths, trs2,
+                    html.escape(str(hist.get("updated") or "—")), len(hbd)))
+    else:
+        body += ('<div class="panel"><h3>定时采集历史</h3>'
+                 '<p class="trim">还没有采集记录。容器里每天早上会自动跑一次'
+                 '（cron <code>%s</code>）；也可以手动执行 '
+                 '<code>docker exec &lt;容器&gt; /app/deploy/collect_usage.sh</code> '
+                 '立刻采一轮。</p></div>'
+                 % html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *"))
+
+    body += """<div class="panel"><h3>口径说明</h3><div class="sub" style="padding:0 16px 16px">
+<strong>这里查的是「积分消耗」，不是原始 token 数。</strong>CodeBuddy 采用积分计费，
+模型调用按系数自动扣除积分。<br>
+接口：<code>POST /v2/billing/meter/get-user-daily-usage</code>；
+数据存在 <strong>2–3 小时延迟</strong>，当天为 0 或为空是正常的，不代表没消耗。<br>
+窗口上限 31 天（前端硬限制）。可在「设置」区调默认窗口
+<code>WB_USAGE_DAYS</code>。
+</div></div>"""
+
+    if ts:
+        body += ('<p class="hint">数据时间 %s%s</p>'
+                 % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+                    "（缓存）" if cached else ""))
+    return page("用量", body, on="/usage", msg=msg, nonce=nonce)
+
+
 def view_login(msg=""):
     body = """<div class="card" style="max-width:420px;margin:60px auto">
 <h2>登录</h2>
@@ -899,6 +1219,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, view_logs(nonce=nonce))
         if path == "/update":
             return self._send(200, view_update(nonce=nonce))
+        if path == "/usage":
+            try:
+                _d = int((qs.get("days") or [""])[0])
+            except Exception:
+                _d = None
+            return self._send(200, view_usage(nonce=nonce, days=_d))
+        if path == "/usage/data":
+            # JSON 接口：给页面做「自动定时刷新」用，也方便你自己 curl
+            try:
+                _d = int((qs.get("days") or [""])[0])
+            except Exception:
+                _d = None
+            _d = max(1, min(_d or USAGE_DEFAULT_VIEW_DAYS, 31))
+            _rows, _err, _ts, _cached = _usage_rows_cached(
+                _d, force=bool(qs.get("force")))
+            return self._send(200, json.dumps({
+                "ok": not _err, "err": _err, "days": _d,
+                "cached": _cached, "ts": _ts,
+                "rows": _rows}, ensure_ascii=False), "application/json")
         if path == "/job":
             return self._send(200, json.dumps({
                 "running": JOB["running"], "kind": JOB["kind"], "rc": JOB["rc"],
@@ -960,6 +1299,22 @@ class Handler(BaseHTTPRequestHandler):
             uid = (form.get("uid") or "").strip()
             okk, res = check_account(_find_token(uid), uid)
             return self._send(200, view_accounts(msg=(okk, res), nonce=nonce))
+        if path == "/usage/refresh":
+            try:
+                _d = int(form.get("days") or USAGE_DEFAULT_VIEW_DAYS)
+            except Exception:
+                _d = USAGE_DEFAULT_VIEW_DAYS
+            _rows, _err, _ts, _ = _usage_rows_cached(_d, force=True)
+            _n_ok = len([r for r in _rows if r.get("ok")])
+            if _err:
+                _msg = (False, "查询出错：%s" % _err)
+            elif _rows and _n_ok == 0:
+                _msg = (False, "查到 %d 个账号，全部失败。点下面「账号」页检查凭据。" % len(_rows))
+            else:
+                _msg = (True, "已重新查询：%d 天窗口，%d/%d 个账号返回数据。"
+                        % (_d, _n_ok, len(_rows)))
+            return self._send(200, view_usage(msg=_msg, nonce=nonce, days=_d,
+                                              rows=_rows, err=_err, ts=_ts))
         if path == "/update/check":
             info = check_update()
             okc = info.get("behind")

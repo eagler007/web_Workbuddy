@@ -19,7 +19,7 @@ ENV TZ=Asia/Shanghai \
 WORKDIR /app
 
 # 只拷贝运行需要的文件（.dockerignore 已排除 .env / 开发残留）
-COPY wb_daily.py wb_report.py notify.py app.py /app/
+COPY wb_daily.py wb_report.py notify.py usage.py collect_usage.py app.py /app/
 COPY deploy/ /app/deploy/
 COPY static/ /app/static/
 

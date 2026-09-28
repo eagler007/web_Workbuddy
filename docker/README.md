@@ -5,7 +5,7 @@
 - **每日签到** —— 到点自动领积分
 - **派猫猫旅行** —— 先领奖励、再派新一趟（顺序有讲究，见下）
 - **连登奖励兑换** —— 自动兑换已达档位（入门 7 天 / 进阶 14 天 / 巅峰 28 天）
-- **Token / 积分消耗统计** —— 今日消耗、每日走势、每账号明细
+- **Token / 积分消耗统计** —— 今日消耗、每日走势、每账号明细；**独立的「用量」看板页**每天自动采集
 - **推送通知** —— 跑完把结果推到手机（Server 酱 Turbo / Server 酱³ / 通用 Webhook）
 - **Web 控制台** —— 网页上加账号、测活、手动跑、看报告和日志，**白天/夜晚两套主题**
 - **版本更新检测** —— 内置「更新」页，直接比对镜像与 GitHub 最新提交，不用猜有没有新版本
@@ -110,6 +110,7 @@ Token 有效期约 60 天，过期后签到会返回 401 —— 到「账号」�
 |---|---|
 | 总览 | 看账号数 / 最近一次 / 归档量；点「全部账号跑一次」或「只跑这一个」 |
 | 账号 | 加账号（名称 + UID + Token）、测活、删除；Token 永远只显示掩码；AT 剩余天数 ≤3 天标红 |
+| 用量 | **用量看板**：实时查真实积分消耗，KPI + 走势 + 各账号柱状图 + 定时采集历史（见第十三节） |
 | 报告 | 账号概览 + 连登状态 + Token/积分消耗 + 「日期 × 账号」签到矩阵 + 双轴走势 + 明细 |
 | 日志 | 最近一次运行的完整输出（已二次脱敏，token 与推送 key 都打码） |
 | 更新 | 本地/远端版本比对 + 更新命令（见下节） |
@@ -343,7 +344,84 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 
 ---
 
-## 十三、目录结构
+## 十三、用量看板（`/usage`，每天早上自动采集）
+
+控制台第二个 Tab「用量」是一个**独立的看板页**：KPI 横排 + 每日走势 + 各账号迷你柱状图 +
+账号明细 + **定时采集历史**。版式照本机 `token-dashboard` 技能的视觉语言来（深浅色、卡片区块）。
+
+### 它和报告页那个用量区块有什么区别
+
+| | 报告页的用量区块 | 用量看板 `/usage` |
+|---|---|---|
+| 数据来源 | 签到跑完顺手存进归档的 | 独立采集器落盘的 `usage_history.json` |
+| 触发 | `CRON_SCHEDULE`（默认一天三次，跟签到） | `USAGE_CRON`（默认**每天 8:10 一次**） |
+| 窗口 | `WB_USAGE_DAYS` | 同上，但页面上可临时切 1/3/7/14/30 天 |
+| 页面能否实时查 | 否（只读归档） | **能**，打开页面即调真实接口，可点「重新查询」 |
+| 历史留痕 | 归在每日运行记录里 | 单独一份，**按日期归并**，保留 180 天 |
+
+### 自动采集是怎么跑的
+
+容器启动时 `entrypoint.sh` 会写进 crontab 两条：
+
+```
+$CRON_SCHEDULE /app/deploy/run_daily.sh      # 签到 + 派猫（默认 7:30 / 13:30 / 17:30）
+$USAGE_CRON    /app/deploy/collect_usage.sh  # 用量采集（默认 8:10）
+```
+
+采集器 `collect_usage.py` 的特性：
+
+- **只读**：只调查询接口，不改任何远端状态。
+- **幂等**：同一天重复跑**覆盖当天**那一格，不会堆出重复行。
+- **留痕**：某个账号查失败也照记（页面上会显示红色「失败」+原因），比静默不留痕有用。
+- **不含凭据**：落盘只有账号名、掩码 UID、日期、积分 —— **没有任何 token**。
+- **隔离**：单账号失败不影响其它账号；整体异常只影响这次采集，不动已有历史。
+
+改时间直接改 `.env`：
+
+```ini
+USAGE_CRON=10 8 * * *      # 默认：每天早上 8:10
+# USAGE_CRON=0 */6 * * *   # 想每 6 小时采一次
+# USAGE_CRON=30 7 * * 1-5  # 只有工作日早上 7:30
+```
+
+改完 `docker compose up -d` 重建容器即可（crontab 在启动时生成）。
+
+### 想立刻采一轮（不等定时）
+
+```bash
+docker exec workbuddy /app/deploy/collect_usage.sh
+```
+
+或者不进容器，用控制台：打开「用量」页点「重新查询」——
+那是**实时查接口**，和采集器落盘不同（不会写历史文件）。
+
+### 页面上的「查询」和「采集」是两件事
+
+- **打开页面** → 实时调 `get-user-daily-usage`，结果缓存 `WB_USAGE_CACHE_TTL` 秒（默认 60），
+  点「重新查询」强制刷新。**这一步不落盘**，纯展示。
+- **每天早上 8:10** → `collect_usage.sh` 跑一轮，把结果写进 `usage_history.json`。
+  页面下半部分「定时采集历史」读的就是它。
+
+所以：想看实时数 → 看上半部分；想看「历史每天消耗了多少」→ 看下半部分的历史表。
+
+### 相关开关
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `USAGE_CRON` | `10 8 * * *` | 采集时间（cron 表达式，容器 TZ 生效） |
+| `WB_USAGE_DAYS` | `7` | 采集与展示的窗口天数（1~31） |
+| `WB_USAGE_CACHE_TTL` | `60` | 页面查询缓存秒数（最小 5） |
+| `WB_USAGE` | `1` | `0` = 签到流程里完全不请求用量接口 |
+
+### 口径（照抄，别理解偏）
+
+- 这是**积分消耗**，不是原始 token 数。CodeBuddy 按积分计费，字段叫 `credit`。
+- 官方原文「用量数据存在 **2-3 小时**的数据延迟」→ 当天偏小/为空是正常的。
+- 窗口上限 **31 天**，前端硬限制。
+
+---
+
+## 十四、目录结构
 
 ```
 docker/
@@ -353,15 +431,20 @@ docker/
 ├── .env.example               环境变量模板
 ├── .dockerignore              构建排除（含 .env，绝不进镜像）
 ├── app.py                     Web 控制台（标准库 ThreadingHTTPServer）
-│                              含 /update 版本比对页、推送通道状态显示
+│                              含 /update 版本比对页、/usage 用量看板、推送通道状态显示
 ├── wb_daily.py                签到 + 派猫 + 连登 + 用量 + 归档 + 推送（cron 调用）
 │                              支持 --doctor 只读自检
 ├── wb_report.py               聚合报告渲染
 ├── notify.py                  推送模块（Server 酱 Turbo / ³ / 通用 Webhook）
 │                              纯标准库；render_text() 是纯函数，可离线单测
+├── usage.py                   用量查询模块（get_daily_usage / query_accounts / merge_rows）
+│                              控制台与采集器共用；不 import wb_daily
+├── collect_usage.py           用量采集器：查真实接口 → 落 usage_history.json
+│                              按日期归并（幂等）、只留掩码 UID、不含任何凭据
 ├── deploy/
-│   ├── entrypoint.sh          起 supercronic + 前台 Web
+│   ├── entrypoint.sh          起 supercronic + 前台 Web（写两条 cron）
 │   ├── run_daily.sh           签到+派猫+连登+用量+报告+推送（flock 防重叠）
+│   ├── collect_usage.sh       用量采集（独立任务，flock 防重叠）
 │   └── run_report.sh          只渲染报告
 └── static/
     ├── theme.css              统一主题（浅色 + 深色两套 CSS 变量）★ 三个页面共用
@@ -378,7 +461,7 @@ docker/
 
 ---
 
-## 十四、本机开发 / 测试
+## 十五、本机开发 / 测试
 
 不需要 Docker 也能跑（纯标准库，零依赖）：
 
@@ -395,6 +478,12 @@ python3 notify.py
 
 # 4) 渲染一份假数据报告（不联网）
 DATA_DIR=./data python3 wb_report.py --report out.html
+
+# 5) 用量模块离线自测（不联网）
+python3 usage.py
+
+# 6) 手动采一轮用量（需要真实账号；--dry-run 只查不落盘）
+DATA_DIR=./data python3 collect_usage.py --days 7 --print --dry-run
 ```
 
 测试脚本在仓库 `_diag/`（不入镜像）：
@@ -403,6 +492,7 @@ DATA_DIR=./data python3 wb_report.py --report out.html
 |---|---|
 | `test_theme_notify.py` | 主题机制 / 旧归档降级 / 通知渲染 / 时机判定 / key 不泄漏 / 控制台页面 / 单次报告 |
 | `test_notify_e2e.py` | 起本地 mock HTTP 服务，真发一次推送，验 JSON 形状 + 自定义模板 + 坏模板隔离 + 不可达不炸 |
+| `test_usage_dashboard.py` | **用量看板**：窗口边界 / 补洞 / 多账号求和 / 采集幂等 / 落盘不含凭据 / 页面各区块 / 历史降级 / 图表除零与转义 |
 | `test_redeem_plan.py` | 连登兑换计划（纯函数） |
 | `test_usage.py` / `test_usage_report.py` | 用量接口解析 / 面板渲染 |
 | `test_report_streak.py` | 连登渲染 / 降级 / 今日判定 / token 泄漏 / XSS |
