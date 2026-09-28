@@ -1,2 +1,4 @@
-/* WorkBuddy 助手 —— 保留样式文件（页面样式目前内联在 app.py 的 CSS 里，
-   这里放一份以便将来把样式外链；当前不影响功能）。 */
+/* WorkBuddy 助手 —— 保留样式文件（已废弃）
+   真实样式在 static/theme.css（浅色 + 深色两套变量），
+   页面通过 app.py 的 page() 与 wb_report.py 的 render_report() 内联引入。
+   这个文件保留只为兼容旧引用，内容为空。 */

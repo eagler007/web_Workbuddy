@@ -929,61 +929,90 @@ def fmt_ts(ts):
         return "-"
 
 
+# 单次运行报告：样式和 Web 控制台 / 聚合报告共用 static/theme.css，
+# 且必须内联（这个文件也可能被单独打开、离线看）。
+_HERE_S = os.path.dirname(os.path.abspath(__file__))
+def _strip_css_comments(css):
+    """内联前剥掉 CSS 注释：注释是给人看的，内联进每个页面纯属浪费字节。"""
+    import re as _re
+    out = _re.sub(r"/\*.*?\*/", "", css, flags=_re.S)
+    out = _re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _read_static(name):
+    for p in (os.path.join(_HERE_S, "static", name), os.path.join(_HERE_S, name)):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            continue
+    return ""
+
+
+_FALLBACK_CSS = """
+html[data-theme=light]{--bg:#f2f3f7;--card:#fff;--line:#eceef3;--fg:#1f2329;
+--mut:#8b8f99;--mut2:#a7abb3;--acc:#6a5cf5;--acc-fg:#fff;--ok:#17a673;--bad:#e34d59;
+--warn:#d98600;--hero1:#6a5cf5;--hero2:#8f7bff;--card2:#f8f8fc;--bd:#eef0f4;}
+html[data-theme=dark]{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;
+--mut:#8b93a7;--mut2:#6d7488;--acc:#7c6cff;--acc-fg:#fff;--ok:#3fb950;--bad:#f85149;
+--warn:#d29922;--hero1:#4c3fd6;--hero2:#6a5cf5;--card2:#1b1f27;--bd:#232833;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"PingFang SC",sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:20px 16px 40px}
+"""
+
+_THEME_BOOT_JS = """
+(function(){try{var k='wb-theme',v=localStorage.getItem(k);
+if(!v){v=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}
+document.documentElement.setAttribute('data-theme',v);
+document.documentElement.style.colorScheme=v;}catch(e){
+document.documentElement.setAttribute('data-theme','light');}})();
+"""
+
+_THEME_BTN = ('<button type="button" class="themebtn" id="wb-theme-btn" '
+              'onclick="wbToggleTheme()" title="切换主题">'
+              '<span class="ico" id="wb-theme-ico">☾</span>'
+              '<span id="wb-theme-label">夜晚</span></button>')
+
+# 单次报告特有的补充样式（主题变量之外的部分）
+_EXTRA_CSS = """
+.hero{background:linear-gradient(135deg,var(--hero1),var(--hero2));border-radius:16px;
+color:#fff;padding:22px 20px;margin-bottom:14px}
+.hero h2{margin:0;font-size:20px;font-weight:600}
+.hero .t{opacity:.92;font-size:13px;margin-top:8px;white-space:pre-line}
+.sec{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:16px;margin-bottom:14px}
+.sec h3{margin:0 0 12px;font-size:16px;font-weight:600}
+.err{margin-top:10px;background:var(--bad-bg);color:var(--bad);border-radius:10px;
+padding:10px 12px;font-size:13px}
+.note{color:var(--mut);font-size:12px;margin-top:14px;line-height:1.8}
+"""
+
 TPL = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="zh-CN" data-theme="light"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy 每日签到</title>
-<style>
- *{box-sizing:border-box}
- body{margin:0;background:#f2f3f7;color:#1f2329;font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
- .wrap{max-width:720px;margin:0 auto;padding:20px 16px 40px}
- h1{font-size:26px;margin:6px 0 2px}
- .meta{color:#8b8f99;font-size:13px;margin-bottom:14px}
- .hero{background:linear-gradient(135deg,#6a5cf5,#8f7bff);border-radius:16px;color:#fff;padding:22px 20px;margin-bottom:14px}
- .hero h2{margin:0;font-size:20px;font-weight:600}
- .hero .t{opacity:.9;font-size:13px;margin-top:8px;white-space:pre-line}
- .cards{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
- .card{flex:1;min-width:130px;background:#fff;border-radius:14px;padding:16px 8px;text-align:center}
- .card .v{font-size:24px;font-weight:700}
- .card .k{color:#8b8f99;font-size:12px;margin-top:4px}
- .panel{background:#fff;border-radius:14px;margin-bottom:14px;overflow:hidden}
- .panel>h3{margin:0;padding:15px 16px 6px;font-size:16px}
- table{width:100%;border-collapse:collapse;font-size:14px}
- th,td{padding:12px 10px;text-align:center;border-bottom:1px solid #f0f1f4}
- th{color:#8b8f99;font-weight:500;font-size:13px}
- td.acc{color:#4b5058;font-family:ui-monospace,Consolas,monospace;font-size:12px}
- td.ok{color:#17a673;font-weight:600}
- td.fail{color:#e34d59;font-weight:600}
- td.credit{color:#17a673;font-weight:600}
- td.credit.zero{color:#8b8f99}
- .foot{padding:12px 10px;color:#8b8f99;font-size:12.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
- .sec{background:#fff;border-radius:14px;padding:16px;margin-bottom:14px}
- .sec h3{margin:0 0 12px;font-size:16px}
- .kv{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #f0f1f4;font-size:14px}
- .kv:last-child{border-bottom:0}
- .kv span{color:#8b8f99;white-space:nowrap}
- .kv b{font-weight:600;text-align:right}
- .err{margin-top:10px;background:#fff5f5;color:#c0392b;border-radius:10px;padding:10px 12px;font-size:13px}
- .note{color:#9aa0aa;font-size:12px;margin-top:14px;line-height:1.8}
- .acct{border:1px solid #eef0f4;border-radius:12px;padding:14px;margin-bottom:10px}
- .acct h4{margin:0 0 4px;font-size:15px}
- .acct .uid{color:#9aa0aa;font-size:11.5px;font-family:ui-monospace,Consolas,monospace;word-break:break-all;margin-bottom:8px}
- .tag{display:inline-block;padding:1px 7px;border-radius:8px;font-size:11.5px;margin-left:6px}
-</style></head>
+<script>__BOOTJS__</script>
+<style>__THEMECSS__</style><style>__EXTRACSS__</style></head>
 <body><div class="wrap">
- <h1>WorkBuddy 每日签到</h1>
- <div class="meta">__TS__</div>
+ <div style="display:flex;align-items:center;margin-bottom:6px">
+   <h1 style="margin:0;font-size:26px">WorkBuddy 每日签到</h1>
+   <span style="margin-left:auto">__THEMEBTN__</span>
+ </div>
+ <div class="meta" style="color:var(--mut);font-size:13px;margin-bottom:14px">__TS__</div>
  <div class="hero"><h2>WorkBuddy 每日签到</h2><div class="t">__VERDICT__</div></div>
  <div class="cards">
-   <div class="card"><div class="v">__TODAY__</div><div class="k">今日获取</div></div>
-   <div class="card"><div class="v">__BALANCE__</div><div class="k">账户总余额</div></div>
-   <div class="card"><div class="v">__N__</div><div class="k">账号数</div></div>
-   <div class="card"><div class="v">__OKN__</div><div class="k">签到成功</div></div>
+   <div class="mcard"><div class="v">__TODAY__</div><div class="k">今日获取</div></div>
+   <div class="mcard"><div class="v">__BALANCE__</div><div class="k">账户总余额</div></div>
+   <div class="mcard"><div class="v">__N__</div><div class="k">账号数</div></div>
+   <div class="mcard"><div class="v">__OKN__</div><div class="k">签到成功</div></div>
  </div>
  <div class="panel">
-   <table><thead><tr><th>账号</th><th>状态</th><th>本次积分</th><th>连续</th><th>余额</th></tr></thead>
-   <tbody>__ROWS__</tbody></table>
-   <div class="foot"><span>共 __N__ 个账号</span><span>耗时 __COST__ 秒</span><span>__HISTHINT__</span></div>
+   <div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>本次积分</th>
+   <th>连续</th><th>余额</th></tr></thead>
+   <tbody>__ROWS__</tbody></table></div>
+   <div class="bar"><span>共 __N__ 个账号</span><span>耗时 __COST__ 秒</span><span>__HISTHINT__</span></div>
  </div>
  <div class="sec">
    <h3>各账号明细</h3>
@@ -995,8 +1024,9 @@ TPL = """<!DOCTYPE html>
    __CAT_ERR__
  </div>
  <div class="note">签到结论：__VERDICT__。猫猫部分失败不影响签到结论。<br>
- 完整历史（多账号 × 多日期）请看 <code>wb_daily_report.html</code>，由 <code>wb_report.py</code> 生成；本页数据也已写入 <code>data/wb_history.json</code>。</div>
-</div></body></html>
+ 完整历史（多账号 × 多日期）请看控制台的「报告」页；本页数据也已写入
+ <code>data/wb_history.json</code>。</div>
+</div><script>__THEMEJS__</script></body></html>
 """
 
 
@@ -1040,10 +1070,11 @@ def render_html(ctx):
              "%s / %s / %s" % (a.get("tc"), a.get("buy"), a.get("rw"))),
         ]
         cards.append(
-            '<div class="acct"><h4>%s<span class="tag" style="background:%s">%s</span></h4>'
+            '<div class="acct"><h4>%s<span class="tag" style="background:%s;color:%s">%s</span></h4>'
             '<div class="uid">%s</div>%s</div>' % (
                 html.escape(a["name"]),
-                "#e8f7f0" if ok else "#fdecee",
+                "var(--ok-bg)" if ok else "var(--bad-bg)",
+                "var(--ok)" if ok else "var(--bad)",
                 "已签到" if ok else "未成功",
                 html.escape(a["uid"]),
                 "".join('<div class="kv"><span>%s</span><b>%s</b></div>'
@@ -1068,6 +1099,12 @@ def render_html(ctx):
         if not cat.get("ok") else ""
 
     repl = {
+        "__BOOTJS__": _THEME_BOOT_JS,
+        "__THEMECSS__": (_strip_css_comments(_read_static("theme.css"))
+                         or _FALLBACK_CSS),
+        "__EXTRACSS__": _EXTRA_CSS,
+        "__THEMEBTN__": _THEME_BTN,
+        "__THEMEJS__": _read_static("theme.js"),
         "__TS__": ctx["ts_text"],
         "__TODAY__": ("+%g" % ctx["total_credit"]) if ctx["total_credit"] else "+0",
         "__BALANCE__": ctx["balance_text"],
@@ -1234,6 +1271,8 @@ def main():
     ap.add_argument("--raw-log", default="wb_daily_raw.log",
                     help="原始响应落盘路径（默认在 DATA_DIR 下）")
     ap.add_argument("--no-history", action="store_true", help="不写入 wb_history.json")
+    ap.add_argument("--no-notify", action="store_true",
+                    help="不推送通知（等价于 WB_NOTIFY=0）")
     ap.add_argument("--account", default="", help="只跑指定账号（按名字/uid 前缀匹配）")
     args = ap.parse_args()
 
@@ -1328,6 +1367,34 @@ def main():
     print("多账号历史报告: 跑 wb_report.py --no-sync 生成")
     print("耗时: %s 秒" % cost)
 
+    # ---- 推送通知（Server 酱 / 通用 Webhook）----
+    # 隔离纪律同派猫/连登/用量：整段 try/except 包住，任何失败都只打印一行，
+    # 绝不改退出码 —— 推送发不出去不等于签到失败。
+    if not args.no_notify:
+        try:
+            import notify as _nt
+
+            _cfg = _nt.Config()
+            print("推送: %s（%s）" % ("开" if _cfg.enabled else "关", _cfg.describe()))
+            if _cfg.enabled and _cfg.channels():
+                _summ = _nt.build_summary(results, ok_count, total_credit, total_after,
+                                          cost, args)
+                _nr = _nt.notify(_summ, log=None, cfg=_cfg)
+                if _nr.get("skipped"):
+                    print("      未发送：%s" % _nr["skipped"])
+                else:
+                    for _ch, _ok, _msg in [(k, v[0], v[1])
+                                           for k, v in (_nr.get("results") or {}).items()]:
+                        print("      %s: %s" % (_ch, "成功" if _ok else "失败（%s）" % _msg))
+                    if _nr.get("sent"):
+                        print("      已推送至：%s" % "、".join(_nr["sent"]))
+                    if _nr.get("err"):
+                        print("      推送异常（不影响签到结论）：%s" % _nr["err"])
+            elif _cfg.enabled:
+                print("      未配置任何通道（WB_SENDKEY / WB_SENDKEY3 / WB_NOTIFY_WEBHOOK）")
+        except Exception as e:
+            print("推送异常（不影响签到结论）：%s: %s" % (type(e).__name__, e))
+
     # 退出码：只要有账号签到成功就算成（"签到成功就算成"）
     return 0 if ok_count > 0 else 1
 
@@ -1350,5 +1417,84 @@ def _cat_combined(results):
     return {"ok": ok_all, "err": None, "claim": "；".join(lines), "depart": None, "final": None}
 
 
+# ---------------------------------------------------------------- 环境自检
+def doctor():
+    """只读自检：不碰网络（除非显式 --net），检查配置与账号是否就位。
+
+    用途：老板在飞牛上「跑不起来」时先跑这个，一眼看出是哪一层的问题。
+    """
+    ok = True
+    print("=" * 62)
+    print("WorkBuddy 每日助手 自检")
+    print("=" * 62)
+
+    # 1) 数据目录
+    print("\n[1] 数据目录")
+    print("    DATA_DIR = %s" % DATA_DIR)
+    print("    存在 = %s，可写 = %s" % (os.path.isdir(DATA_DIR),
+                                       os.access(DATA_DIR, os.W_OK)))
+
+    # 2) 账号
+    print("\n[2] 账号（token 一律掩码）")
+    try:
+        accs = load_accounts()
+    except Exception as e:
+        accs, ok = [], False
+        print("    [错误] 读账号失败：%s" % e)
+    if not accs:
+        print("    [错误] 一个账号都没有。去 Web 控制台「账号」页添加，")
+        print("           或设 WB_ACCOUNTS_JSON / WORKBUDDY_ACCESS_TOKEN+WORKBUDDY_UID。")
+        ok = False
+    for a in accs:
+        exp = days_left(a.get("expiresAt") or jwt_exp(a["token"]))
+        rt = days_left(a.get("refreshExpiresAt"))
+        warn = ""
+        if exp is not None and exp <= 3:
+            warn = "  ⚠️ AT 即将过期"
+        print("    - %-14s uid=%s  token=%s  AT剩余=%s天 RT剩余=%s天%s"
+              % (a["name"], mask(a["uid"]), mask(a["token"]),
+                 "?" if exp is None else exp, "?" if rt is None else rt, warn))
+        if exp is not None and exp <= 0:
+            ok = False
+
+    # 3) 开关
+    print("\n[3] 功能开关（环境变量）")
+    for k, d in (("WB_GROWTH", True), ("WB_STREAK_REDEEM", True),
+                 ("WB_STREAK_MAKEUP", False), ("WB_USAGE", True),
+                 ("WB_NOTIFY", True)):
+        print("    %-18s = %s" % (k, "开" if _env_on(k, d) else "关"))
+    print("    %-18s = %s" % ("WB_USAGE_DAYS", os.environ.get("WB_USAGE_DAYS") or USAGE_DEFAULT_DAYS))
+    print("    %-18s = %s" % ("CRON_SCHEDULE", os.environ.get("CRON_SCHEDULE") or "30 7,13,17 * * *"))
+
+    # 4) 推送
+    print("\n[4] 推送通道")
+    try:
+        import notify as _nt
+        d = _nt.describe_channels()
+        print("    总开关 = %s，时机 = %s" % ("开" if d["enabled"] else "关", d["on"]))
+        print("    通道 = %s" % d["desc"])
+        if d["enabled"] and not d["channels"]:
+            print("    [提示] 没配通道，推送会静默跳过（不影响签到）。")
+    except Exception as e:
+        print("    [错误] 加载 notify 失败：%s" % e)
+        ok = False
+
+    # 5) 报告 / 归档
+    print("\n[5] 归档")
+    h = load_history()
+    runs = [r for r in h.get("runs", []) if r.get("accounts")]
+    print("    wb_history.json 存在 = %s，有效记录 = %d 条" % (os.path.isfile(HISTORY_FILE), len(runs)))
+    if runs:
+        print("    最近一次 = %s" % runs[-1].get("ts"))
+
+    print("\n" + "=" * 62)
+    print("自检结论：%s" % ("基本就绪" if ok else "有阻塞项，见上面 [错误]"))
+    print("=" * 62)
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    # --doctor / doctor 子命令：只读自检，绕过 argparse（它没有这些参数）
+    if [a for a in sys.argv[1:] if a in ("--doctor", "doctor")]:
+        sys.exit(doctor())
     sys.exit(main())

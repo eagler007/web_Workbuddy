@@ -169,6 +169,27 @@ def delete_account(uid):
 
 
 # ---------------------------------------------------------------- 测活
+def _token_days(token, acc=None):
+    """accessToken 还剩多少天。优先用账号里存的 expiresAt，退回解 JWT 的 exp。"""
+    exp = None
+    if isinstance(acc, dict) and acc.get("expiresAt"):
+        exp = acc["expiresAt"]
+    if not exp and token:
+        try:
+            part = token.split(".")[1]
+            part += "=" * (-len(part) % 4)
+            exp = json.loads(base64.urlsafe_b64decode(part).decode("utf-8", "replace")).get("exp")
+        except Exception:
+            exp = None
+    if not exp:
+        return None
+    try:
+        left = (float(exp) - time.time()) / 86400.0
+    except Exception:
+        return None
+    return max(0, int(round(left)))
+
+
 def check_account(token, uid):
     """调一次查余额接口。返回 (ok, 摘要文本)。token 不进日志。"""
     if not token or not uid:
@@ -326,73 +347,85 @@ def check_password(pw):
 
 
 # ---------------------------------------------------------------- 页面
-CSS = """
-:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a7;
---ok:#3fb950;--bad:#f85149;--warn:#d29922;--acc:#4493f8;}
+# 样式统一走 static/theme.css（浅色 + 深色两套变量），这里读进来内联，
+# 好处：单文件、无外链、离线可用，且和报告页共用同一份主题定义，风格必然一致。
+STATIC_DIR = os.path.join(HERE, "static")
+
+
+def _read_static(name):
+    try:
+        with open(os.path.join(STATIC_DIR, name), "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _strip_css_comments(css):
+    """内联前剥掉 CSS 注释：注释是给人看的，内联进每个页面纯属浪费字节。"""
+    import re as _re
+    out = _re.sub(r"/\*.*?\*/", "", css, flags=_re.S)
+    out = _re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _theme_css():
+    return _strip_css_comments(_read_static("theme.css")) or _FALLBACK_CSS
+
+
+def _theme_js():
+    return _read_static("theme.js") or ""
+
+
+# 万一 static/ 丢了（挂载错误等），至少别变成无样式裸页
+_FALLBACK_CSS = """
+html[data-theme=light]{--bg:#f2f3f7;--card:#fff;--line:#eceef3;--fg:#1f2329;
+--mut:#8b8f99;--acc:#6a5cf5;--acc-fg:#fff;--ok:#17a673;--bad:#e34d59;--warn:#d98600;}
+html[data-theme=dark]{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;
+--mut:#8b93a7;--acc:#7c6cff;--acc-fg:#fff;--ok:#3fb950;--bad:#f85149;--warn:#d29922;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-a{color:var(--acc);text-decoration:none}
-a:hover{text-decoration:underline}
-.wrap{max-width:1080px;margin:0 auto;padding:20px}
-header{display:flex;align-items:center;gap:16px;border-bottom:1px solid var(--line);
-padding:14px 0;margin-bottom:20px;flex-wrap:wrap}
-header h1{font-size:17px;margin:0;font-weight:600}
-nav{display:flex;gap:14px;margin-left:auto;flex-wrap:wrap}
-nav a{color:var(--mut)}
-nav a.on{color:var(--fg);font-weight:600}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
-padding:16px 18px;margin-bottom:16px}
-.card h2{font-size:15px;margin:0 0 12px;font-weight:600}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:13px}
-th{color:var(--mut);font-weight:500}
-code,.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
-input,select{background:#0d1014;border:1px solid var(--line);color:var(--fg);
-padding:8px 10px;border-radius:7px;font-size:13px;width:100%}
-label{display:block;color:var(--mut);font-size:12px;margin:10px 0 4px}
-button{background:var(--acc);color:#fff;border:0;padding:8px 14px;border-radius:7px;
-font-size:13px;cursor:pointer}
-button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
-button.danger{background:transparent;border:1px solid var(--bad);color:var(--bad)}
-button:disabled{opacity:.45;cursor:default}
-.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
-.row>div{flex:1;min-width:160px}
-.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;
-border:1px solid var(--line);color:var(--mut)}
-.pill.ok{color:var(--ok);border-color:#1f6f3a;background:#0d2818}
-.pill.bad{color:var(--bad);border-color:#7d2b26;background:#2b1310}
-.pill.warn{color:var(--warn);border-color:#7a5b12;background:#251c07}
-pre{background:#0d1014;border:1px solid var(--line);border-radius:8px;padding:12px;
-overflow:auto;max-height:460px;font-size:12px;line-height:1.5;white-space:pre-wrap;
-word-break:break-all}
-.mut{color:var(--mut)}
-.msg{padding:9px 12px;border-radius:7px;margin-bottom:14px;font-size:13px}
-.msg.ok{background:#0d2818;border:1px solid #1f6f3a;color:#7ee2a8}
-.msg.bad{background:#2b1310;border:1px solid #7d2b26;color:#ff9c94}
-.hint{color:var(--mut);font-size:12px;margin-top:8px}
-.actions{display:flex;gap:8px;flex-wrap:wrap}
+font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
 """
 
+# 防闪白：主题必须在 <head> 里、样式之前定下来，否则先渲染浅色再跳深色。
+# 这段和 static/theme.js 的逻辑保持一致（那边负责按钮交互）。
+THEME_BOOT_JS = """
+(function(){try{var k='wb-theme',v=localStorage.getItem(k);
+if(!v){v=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}
+document.documentElement.setAttribute('data-theme',v);
+document.documentElement.style.colorScheme=v;}catch(e){
+document.documentElement.setAttribute('data-theme','light');}})();
+"""
 
-def page(title, body, on="", msg="", nonce=""):
+THEME_BTN = ('<button type="button" class="themebtn" id="wb-theme-btn" '
+             'onclick="wbToggleTheme()" title="切换主题">'
+             '<span class="ico" id="wb-theme-ico">☾</span>'
+             '<span id="wb-theme-label">夜晚</span></button>')
+
+
+def page(title, body, on="", msg="", nonce="", extra_head="", extra_body=""):
     nav = [("/", "总览"), ("/accounts", "账号"), ("/report", "报告"),
-           ("/logs", "日志")]
+           ("/logs", "日志"), ("/update", "更新")]
     links = "".join('<a href="%s"%s>%s</a>' %
                     (h, ' class="on"' if h == on else "", t) for h, t in nav)
-    links += '<a href="/logout">退出</a>'
     m = ""
     if msg:
         kind = "ok" if msg[0] else "bad"
         m = '<div class="msg %s">%s</div>' % (kind, html.escape(msg[1]))
-    return """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+    return """<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>%s · WorkBuddy 助手</title><style>%s</style></head><body><div class="wrap">
-<header><h1>WorkBuddy 每日助手</h1><nav>%s</nav></header>
+<title>%s · WorkBuddy 助手</title>
+<script>%s</script><style>%s</style>%s</head><body><div class="wrap">
+<header><h1><a href="/" style="color:inherit;text-decoration:none">WorkBuddy 每日助手</a></h1>
+<nav>%s%s<a href="/logout">退出</a></nav></header>
 %s%s
 <footer class="hint" style="margin-top:28px">数据目录 %s · <span class="mono">%s</span></footer>
-</div></body></html>""" % (html.escape(title), CSS, links, m, body,
-                           html.escape(DATA_DIR), time.strftime("%Y-%m-%d %H:%M:%S"))
+</div><script>%s</script>%s</body></html>""" % (
+        html.escape(title), THEME_BOOT_JS, _theme_css(), extra_head,
+        links, THEME_BTN, m, body,
+        html.escape(DATA_DIR), time.strftime("%Y-%m-%d %H:%M:%S"),
+        _theme_js(), extra_body)
 
 
 def view_home(msg="", nonce=""):
@@ -413,11 +446,11 @@ def view_home(msg="", nonce=""):
         ("归档记录", str(len(runs)), "最近 5 次" if runs else "还没有数据"),
     ]
     card_html = "".join(
-        '<div class="card" style="flex:1;min-width:180px"><div class="mut">%s</div>'
-        '<div style="font-size:26px;font-weight:600;margin:4px 0">%s</div>'
-        '<div class="mut" style="font-size:12px">%s</div></div>' % c for c in cards)
+        '<div class="mcard"><div class="v">%s</div><div class="k">%s</div>'
+        '<div class="s">%s</div></div>' % (html.escape(c[1]), html.escape(c[0]),
+                                           html.escape(c[2])) for c in cards)
 
-    body = '<div class="row" style="gap:16px;margin-bottom:16px">%s</div>' % card_html
+    body = '<div class="cards">%s</div>' % card_html
 
     # 手动运行区
     opts = "".join('<option value="%s">%s</option>' %
@@ -439,19 +472,19 @@ def view_home(msg="", nonce=""):
         rows = ""
         for r in reversed(runs):
             s = r.get("summary", {}) or {}
-            rows += ("<tr><td class=mono>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+            rows += ("<tr><td class='acc'>%s</td><td>%s</td><td>%s</td><td>%s</td>"
                      "<td>%s</td></tr>") % (
                 html.escape(str(r.get("date", ""))),
                 html.escape(str(r.get("task_note", ""))),
                 html.escape(str(len(r.get("accounts", [])))),
                 html.escape(str(s.get("diff", "—"))),
                 html.escape(str(s.get("after", "—"))))
-        body += ("<div class='card'><h2>最近几次运行</h2><table>"
+        body += ("<div class='panel'><h3>最近几次运行</h3><div class='scroll'><table>"
                  "<tr><th>日期</th><th>来源</th><th>账号</th><th>当日积分</th>"
-                 "<th>总余额</th></tr>%s</table></div>") % rows
+                 "<th>总余额</th></tr>%s</table></div></div>") % rows
     else:
-        body += ("<div class='card'><h2>最近几次运行</h2>"
-                 "<p class='mut'>还没有归档数据。先加账号，再点「全部账号跑一次」。</p></div>")
+        body += ("<div class='panel'><h3>最近几次运行</h3>"
+                 "<p class='trim'>还没有归档数据。先加账号，再点「全部账号跑一次」。</p></div>")
 
     body += """<script>
 async function poll(){try{const r=await fetch('/job',{headers:{'X-Requested-With':'fetch'}});
@@ -471,11 +504,20 @@ def view_accounts(msg="", nonce=""):
     accs = load_accounts()
     rows = ""
     for i, a in enumerate(accs, 1):
+        exp = _token_days(a["token"], a)
+        if exp is None:
+            exp_txt = '<span class="mut">—</span>'
+        elif exp <= 3:
+            exp_txt = '<span class="st bad">%d 天</span>' % exp
+        elif exp <= 14:
+            exp_txt = '<span class="st warn">%d 天</span>' % exp
+        else:
+            exp_txt = '<span class="st ok">%d 天</span>' % exp
         rows += """<tr>
 <td>%d</td>
-<td>%s<br><span class="mono mut">%s</span></td>
+<td class="acc">%s<br><span class="mono mutd">%s</span></td>
 <td class="mono">%s</td>
-<td class="mono mut">%s</td>
+<td>%s</td>
 <td><div class="actions">
 <form method="post" action="/check"><input type="hidden" name="csrf" value="%s">
 <input type="hidden" name="uid" value="%s"><button class="ghost">测活</button></form>
@@ -483,17 +525,35 @@ def view_accounts(msg="", nonce=""):
 <input type="hidden" name="csrf" value="%s"><input type="hidden" name="uid" value="%s">
 <button class="danger">删除</button></form></div></td></tr>""" % (
             i, html.escape(a["name"]), html.escape(a["uid"]),
-            html.escape(mask(a["token"])), html.escape(mask(a["uid"])),
+            html.escape(mask(a["token"])), exp_txt,
             nonce, html.escape(a["uid"]),
             html.escape(a["name"]), nonce, html.escape(a["uid"]))
 
-    table = ("<table><tr><th>#</th><th>名称 / UID</th><th>Token</th><th>UID</th>"
-             "<th>操作</th></tr>%s</table>" % rows) if accs else \
-        "<p class='mut'>还没有账号。在下面填入 Token 和 UID 添加第一个。</p>"
+    table = ("<div class='scroll'><table><tr><th>#</th><th>名称 / UID</th><th>Token</th>"
+             "<th>AT 剩余</th><th>操作</th></tr>%s</table></div>" % rows) if accs else \
+        "<p class='trim'>还没有账号。在下面填入 Token 和 UID 添加第一个。</p>"
 
-    body = """<div class="card"><h2>已有账号（%d）</h2>%s
-<p class="hint">Token 只显示前 8 位掩码，完整值不经过页面。要换 Token 就用同一个 UID
-重新提交一次。</p></div>
+    # 推送通道状态：让老板一眼看到「配没配、会不会发」
+    try:
+        import notify as _nt
+        _nd = _nt.describe_channels()
+        if _nd["enabled"] and _nd["channels"]:
+            push_html = ('<div class="msg ok">推送已开启：%s（时机 %s）</div>'
+                         % (html.escape(_nd["desc"]), html.escape(_nd["on"])))
+        elif _nd["enabled"]:
+            push_html = ('<div class="msg bad">推送开关是开的，但<b>没配置任何通道</b> —— '
+                         '会静默跳过。在 .env 里填 <code>WB_SENDKEY</code>（Server 酱）'
+                         '或 <code>WB_NOTIFY_WEBHOOK</code> 后重启容器。</div>')
+        else:
+            push_html = '<div class="msg bad">推送已关闭（WB_NOTIFY=0）。</div>'
+    except Exception as e:
+        push_html = '<div class="msg bad">读推送配置失败：%s</div>' % html.escape(str(e))
+
+    body = """<div class="panel"><h3>已有账号（%d）</h3>
+<div class="sub">Token 只显示前 8 位掩码，完整值不经过页面。要换 Token 就用同一个 UID
+重新提交一次。AT 剩余 = accessToken 有效期，<b>≤3 天会标红</b>，来不及就换新的。</div>
+%s
+</div>
 
 <div class="card"><h2>添加 / 更新账号</h2>
 <form method="post" action="/save" class="row">
@@ -508,22 +568,44 @@ autocomplete="off" spellcheck="false" required></div>
 <button type="submit">保存并测活</button>
 </form>
 <p class="hint">保存后会自动调一次查余额接口验证 Token 是否有效。
-  怎么拿到 Token / UID，见 README「获取凭据」。</p></div>""" % (
-        len(accs), table, nonce)
+  怎么拿到 Token / UID，见 README「获取凭据」。</p></div>
+
+<div class="card"><h2>推送通知（Server 酱 / Webhook）</h2>
+%s
+<p class="hint">
+  在 .env 里配置（改完 <code>docker compose up -d</code> 生效）：<br>
+  · Server 酱 Turbo：<code>WB_SENDKEY=SCTxxxxxxxxx</code>（密钥在 sct.ftqq.com 拿）<br>
+  · Server 酱³：<code>WB_SENDKEY3=你的sendkey</code><br>
+  · 通用 Webhook：<code>WB_NOTIFY_WEBHOOK=https://...</code>（钉钉/飞书/Bark 等）<br>
+  · 推送时机：<code>WB_NOTIFY_ON=always|fail|change</code>（默认每次跑完都发）<br>
+  推送内容和「日志」页看到的一致：每账号签到结果 + 派猫 + 连登兑换 + 当日积分消耗。
+</p></div>""" % (len(accs), table, nonce, push_html)
     return page("账号", body, on="/accounts", msg=msg, nonce=nonce)
 
 
 def view_report(msg=""):
-    """动态渲染聚合报告；渲染不出来就退回静态文件。"""
+    """动态渲染聚合报告；渲染不出来就退回静态文件。
+
+    报告自带完整样式（和本页共用 static/theme.css），所以整段直出、不再套
+    控制台外壳 —— 这样两个页面在视觉上必然一致。只在最前面插一条返回横幅。
+    """
     body = ""
     try:
         htm, err = run_sync_report()
         if htm:
-            body = ("<div class='card' style='padding:8px'>"
-                    "<p class='hint' style='margin:6px 10px'>实时渲染自 %s"
-                    " &nbsp;<a href=\"/report?raw=1\" target=\"_blank\">"
-                    "单独打开</a></p></div>%s") % (html.escape(HISTORY_FILE), htm)
-            return page("报告", body, on="/report", msg=msg, nonce="")
+            banner = (
+                '<div class="wrap" style="padding-bottom:0"><div class="card" '
+                'style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;'
+                'padding:10px 14px;margin-bottom:0">'
+                '<span class="hint" style="margin:0">实时渲染自 %s</span>'
+                '<span style="margin-left:auto;display:flex;gap:12px;align-items:center">'
+                '<a href="/">← 返回控制台</a>'
+                '<a href="/report?raw=1" target="_blank" rel="noopener">单独打开</a>'
+                '%s</span></div></div>') % (html.escape(HISTORY_FILE), THEME_BTN)
+            marker = '<body><div class="wrap">'
+            htm = (htm.replace(marker, '<body>' + banner + '<div class="wrap">', 1)
+                   if marker in htm else banner + htm)
+            return htm
         body = "<div class='card'><p class='mut'>动态渲染失败：%s</p></div>" % html.escape(err)
     except Exception as e:
         body = "<div class='card'><p class='mut'>异常：%s</p></div>" % html.escape(str(e))
@@ -537,7 +619,7 @@ def view_report(msg=""):
     return page("报告", body, on="/report", msg=msg, nonce="")
 
 
-def view_logs(msg=""):
+def view_logs(msg="", nonce=""):
     txt = ""
     if os.path.isfile(RUN_LOG):
         try:
@@ -549,11 +631,145 @@ def view_logs(msg=""):
         txt = "（还没有运行日志）"
     # 二次防线：万一有 token 形态的串，替换掉
     txt = re.sub(r"eyJ[A-Za-z0-9._\-]{20,}", "***REDACTED***", txt)
-    body = """<div class="card"><h2>最近一次运行的输出</h2>
-<pre>%s</pre>
-<p class="hint">这里只保留最后一次（%s）。历史日志随运行覆盖。</p></div>""" % (
-        html.escape(txt), html.escape(RUN_LOG))
-    return page("日志", body, on="/logs", msg=msg, nonce="")
+    # 第三道防线：推送 key（Server 酱 SCT… / ³ 形如 xxxxxtxxxxxx）也不能漏出去
+    txt = re.sub(r"\bSCT[A-Za-z0-9]{6,}", "***REDACTED***", txt)
+    body = """<div class="panel"><h3>最近一次运行的输出</h3>
+<div class="sub">这里只保留最后一次（%s）。历史日志随运行覆盖。</div>
+<pre style="margin:0 16px 16px">%s</pre></div>""" % (
+        html.escape(RUN_LOG), html.escape(txt))
+    return page("日志", body, on="/logs", msg=msg, nonce=nonce)
+
+
+# ---------------------------------------------------------------- 更新检查
+GITHUB_REPO = os.environ.get("WB_GITHUB_REPO", "eagler007/web_workbuddy")
+GHCR_IMAGE = "ghcr.io/" + GITHUB_REPO.lower() + ":latest"
+
+
+def _http_json(url, timeout=10, token=""):
+    """读 JSON；返回 (ok, 数据 或 错误文本, http)。"""
+    hdr = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    if token:
+        hdr["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return True, json.loads(r.read().decode("utf-8", "replace")), r.status
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            raw = ""
+        return False, "HTTP %s %s" % (e.code, raw), e.code
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e), 0
+
+
+def _local_revision():
+    """本地镜像带进来的 commit sha（Dockerfile 构建时写进 /app/WB_REVISION）。"""
+    for p in (os.path.join(HERE, "WB_REVISION"), "/app/WB_REVISION"):
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+                if v:
+                    return v
+        except Exception:
+            pass
+    return ""
+
+
+def check_update():
+    """查远端最新 commit，和本地比对。
+
+    为什么得自己查：飞牛的镜像管理只比 **tag**，而本项目所有构建都用
+    :latest —— tag 永远不变，它自然不提示「有新版本」。真正变的是 commit。
+    这里直接问 GitHub API 的 main 分支 HEAD，和本地 WB_REVISION 比。
+    """
+    token = os.environ.get("WB_GITHUB_TOKEN", "").strip()
+    ok, data, code = _http_json(
+        "https://api.github.com/repos/%s/commits/main" % GITHUB_REPO, token=token)
+    local = _local_revision()
+    r = {"ok": ok, "err": None, "local": local, "remote": None, "remote_date": None,
+         "remote_msg": None, "remote_url": None, "behind": None, "repo": GITHUB_REPO,
+         "image": GHCR_IMAGE, "has_token": bool(token)}
+    if not ok:
+        r["err"] = ("查不到远端版本：%s。"
+                    "（GitHub API 匿名访问有次数限制；在 .env 里设 WB_GITHUB_TOKEN "
+                    "可提高额度，只读权限就够。）" % data)
+        return r
+    if isinstance(data, dict):
+        r["remote"] = data.get("sha") or ""
+        c = data.get("commit") or {}
+        r["remote_date"] = (c.get("committer") or {}).get("date") or ""
+        r["remote_msg"] = (c.get("message") or "").split("\n")[0][:120]
+        r["remote_url"] = data.get("html_url")
+    if local and r["remote"]:
+        r["behind"] = (local[:12] != r["remote"][:12])
+    elif not local:
+        r["err"] = ("镜像里没有 WB_REVISION 文件 —— 这个镜像是在本功能之前构建的，"
+                    "先更新一次之后就能自动比对了。")
+    return r
+
+
+def view_update(msg="", nonce="", info=None):
+    """更新页：显示本地 / 远端版本，并给出飞牛上的更新命令。"""
+    if info is None:
+        info = check_update()
+
+    def _s(v):
+        return html.escape(str(v)) if v else "<span class='mut'>—</span>"
+
+    if info.get("behind") is True:
+        status = ('<div class="msg bad">发现新版本：远端 commit 与本地不一致，建议更新。</div>')
+    elif info.get("behind") is False:
+        status = '<div class="msg ok">已是最新版本（本地 commit 与远端一致）。</div>'
+    else:
+        status = ('<div class="msg bad">%s</div>'
+                  % html.escape(info.get("err") or "状态未知"))
+
+    def _row(k, v):
+        return ('<div class="kv"><span>%s</span>'
+                '<b class="mono" style="font-size:12px">%s</b></div>'
+                % (html.escape(k), v))
+
+    ver = [_row("仓库", _s(info.get("repo"))),
+           _row("镜像", _s(info.get("image"))),
+           _row("本地 commit", _s((info.get("local") or "")[:12])),
+           _row("远端 commit", _s((info.get("remote") or "")[:12])),
+           _row("远端提交时间", _s(info.get("remote_date"))),
+           _row("远端最新提交", _s(info.get("remote_msg")))]
+    if info.get("remote_url"):
+        ver.append('<div class="kv"><span>查看提交</span><b><a href="%s" target="_blank" '
+                   'rel="noopener">在 GitHub 打开 ↗</a></b></div>' % html.escape(info["remote_url"]))
+
+    cmd = ("cd /vol1/docker/workbuddy\n"
+           "docker compose pull\n"
+           "docker compose up -d")
+
+    body = """<div class="panel">
+<h3>版本状态</h3>
+<div class="sub">飞牛的「镜像管理」只比对 <strong>tag</strong>，而本项目的构建全部用
+<code>:latest</code> —— tag 永远不变，所以它<strong>不会提示更新</strong>。
+真正变化的是 commit，这里直接和 GitHub 上 main 分支的 HEAD 比对。</div>
+%s
+%s
+</div>
+<div class="panel">
+<h3>怎么更新</h3>
+<div class="sub">在飞牛的终端（或 SSH）里执行下面三条命令。数据都在
+<code>./data</code> 卷里，更新镜像不会动它。</div>
+<pre style="margin:0 16px 16px">%s</pre>
+<form method="post" action="/update/check" class="actions" style="padding:0 16px 16px">
+<input type="hidden" name="csrf" value="%s">
+<button type="submit">重新检查</button>
+</form>
+<p class="hint" style="padding:0 16px 16px">
+  更新完成后回到本页点「重新检查」，两侧 commit 一致就说明成功了。<br>
+  GitHub API 匿名访问有次数限制；在 <code>.env</code> 里加
+  <code>WB_GITHUB_TOKEN=ghp_…</code> 可提高额度（只读权限就够）。
+</p>
+</div>""" % (status, "".join(ver), html.escape(cmd), nonce)
+    return page("更新", body, on="/update", msg=msg, nonce=nonce)
 
 
 def view_login(msg=""):
@@ -566,10 +782,12 @@ def view_login(msg=""):
     m = ""
     if msg:
         m = '<div class="msg bad">%s</div>' % html.escape(msg[1])
-    return """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+    return """<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录 · WorkBuddy 助手</title><style>%s</style></head><body><div class="wrap">
-%s%s</div></body></html>""" % (CSS, m, body)
+<title>登录 · WorkBuddy 助手</title>
+<script>%s</script><style>%s</style></head><body><div class="wrap">
+%s%s</div><script>%s</script></body></html>""" % (
+        THEME_BOOT_JS, _theme_css(), m, body, _theme_js())
 
 
 # ---------------------------------------------------------------- HTTP
@@ -678,7 +896,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts":
             return self._send(200, view_accounts(nonce=nonce))
         if path == "/logs":
-            return self._send(200, view_logs())
+            return self._send(200, view_logs(nonce=nonce))
+        if path == "/update":
+            return self._send(200, view_update(nonce=nonce))
         if path == "/job":
             return self._send(200, json.dumps({
                 "running": JOB["running"], "kind": JOB["kind"], "rc": JOB["rc"],
@@ -740,6 +960,15 @@ class Handler(BaseHTTPRequestHandler):
             uid = (form.get("uid") or "").strip()
             okk, res = check_account(_find_token(uid), uid)
             return self._send(200, view_accounts(msg=(okk, res), nonce=nonce))
+        if path == "/update/check":
+            info = check_update()
+            okc = info.get("behind")
+            msg = (okc is not True,
+                   ("已是最新版本（%s）" % (info.get("local") or "")[:12]) if okc is False
+                   else ("发现新版本：%s → %s" % ((info.get("local") or "")[:12],
+                                                  (info.get("remote") or "")[:12])
+                         if okc is True else (info.get("err") or "检查失败")))
+            return self._send(200, view_update(msg=msg, nonce=nonce, info=info))
         if path == "/run":
             mode = form.get("mode") or "all"
             who = (form.get("account") or "").strip() if mode == "one" else ""

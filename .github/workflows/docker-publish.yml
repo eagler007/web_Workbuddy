@@ -54,6 +54,10 @@ jobs:
           push: true
           # 飞牛的 Intel/AMD 机器是 x86_64，只构 amd64 省额度
           platforms: linux/amd64
+          # 把 commit sha 烤进镜像：控制台「更新」页用它和 GitHub HEAD 比对。
+          # 因为所有构建都推 :latest，tag 永远不变，飞牛的镜像管理不会提示更新。
+          build-args: |
+            WB_REVISION=${{ github.sha }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:latest
             ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:${{ github.sha }}

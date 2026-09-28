@@ -316,71 +316,78 @@ def build_matrix(runs):
 
 
 # ---------------------------------------------------------------- 报告模板
-CSS = """
+# ---------------------------------------------------------------- 主题
+# 样式统一走 static/theme.css（和 Web 控制台共用同一份定义，风格必然一致）。
+# 报告要能「单独打开、离线可看」，所以必须把 CSS/JS **内联**进来，不能外链。
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(HERE, "static")
+
+
+def _read_static(name):
+    for p in (os.path.join(STATIC_DIR, name), os.path.join(HERE, name)):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            continue
+    return ""
+
+
+# 万一 static/ 丢了，报告至少还是能看的两套配色
+_FALLBACK_CSS = """
+html[data-theme=light]{--bg:#f2f3f7;--card:#fff;--line:#eceef3;--fg:#1f2329;
+--mut:#8b8f99;--mut2:#a7abb3;--acc:#6a5cf5;--acc-fg:#fff;--ok:#17a673;--bad:#e34d59;
+--warn:#d98600;--hero1:#6a5cf5;--hero2:#8f7bff;--card2:#f8f8fc;--grid:#eef0f4;
+--chart-bar:#17a673;--chart-line:#6a5cf5;--spark-hi:#6a5cf5;--spark-lo:#c9c3ff;}
+html[data-theme=dark]{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;
+--mut:#8b93a7;--mut2:#6d7488;--acc:#7c6cff;--acc-fg:#fff;--ok:#3fb950;--bad:#f85149;
+--warn:#d29922;--hero1:#4c3fd6;--hero2:#6a5cf5;--card2:#1b1f27;--grid:#232833;
+--chart-bar:#3fb950;--chart-line:#7c6cff;--spark-hi:#7c6cff;--spark-lo:#3a3550;}
 *{box-sizing:border-box}
-body{margin:0;background:#f2f3f7;color:#1f2329;
-     font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:1080px;margin:0 auto;padding:22px 16px 60px}
-h1{font-size:26px;margin:6px 0 2px}
-.meta{color:#8b8f99;font-size:13px;margin-bottom:16px}
-.hero{background:linear-gradient(135deg,#6a5cf5,#8f7bff);border-radius:16px;
-      color:#fff;padding:22px 22px;margin-bottom:14px}
-.hero h2{margin:0;font-size:20px;font-weight:600}
-.hero .t{opacity:.92;font-size:13px;margin-top:8px}
-.cards{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
-.card{flex:1;min-width:150px;background:#fff;border-radius:14px;padding:16px 10px;text-align:center}
-.card .v{font-size:24px;font-weight:700}
-.card .k{color:#8b8f99;font-size:12px;margin-top:4px}
-.panel{background:#fff;border-radius:14px;margin-bottom:16px;overflow:hidden}
-.panel>h3{margin:0;padding:15px 16px 4px;font-size:16px}
-.panel>.sub{color:#8b8f99;font-size:12.5px;padding:0 16px 10px}
-table{width:100%;border-collapse:collapse;font-size:13.5px}
-th,td{padding:10px 8px;text-align:center;border-bottom:1px solid #f0f1f4;white-space:nowrap}
-th{color:#8b8f99;font-weight:500;font-size:12.5px;position:sticky;top:0;background:#fff}
-td.acc{text-align:left;color:#4b5058;font-family:ui-monospace,Consolas,monospace;font-size:12px;
-       white-space:nowrap;max-width:210px;overflow:hidden;text-overflow:ellipsis}
-td.ok{color:#17a673;font-weight:600}
-td.fail{color:#e34d59;font-weight:600}
-td.credit{color:#17a673;font-weight:600}
-td.credit.zero{color:#a7abb3}
-td.ok{color:#17a673;font-weight:600}
-td.bad{color:#e34d59;font-weight:600}
-td.na{color:#a7abb3}
-.st{display:inline-block;padding:1px 8px;border-radius:9px;font-size:12px;
-    font-weight:600;white-space:nowrap}
-.st.ok{background:#e8f7f0;color:#17a673}
-.st.warn{background:#fff5e6;color:#d98600}
-.st.bad{background:#fdecee;color:#e34d59}
-.st.na{background:#f2f3f7;color:#9aa0aa}
-/* ---- Token / 积分消耗面板 ---- */
-.ucard{display:inline-block;min-width:150px;margin:0 10px 12px 16px;padding:12px 14px;
-       background:#f8f8fc;border-radius:12px;vertical-align:top}
-.ucard .uv{font-size:22px;font-weight:700;color:#1f2329}
-.ucard .uk{color:#8b8f99;font-size:12px;margin-top:2px}
-.ucard .us{color:#a7abb3;font-size:11.5px;margin-top:3px}
-.uspark{margin:4px 16px 14px}
-.uspark .uslabel{color:#8b8f99;font-size:12px;margin-bottom:6px}
-svg.spark{display:block;overflow:visible}
-.mutd{color:#c3c7cd}
-.unote{color:#8b8f99;font-size:12px;line-height:1.7;padding:2px 16px 14px}
-.unote strong{color:#6a5cf5}
-.uerr{color:#e34d59;font-size:12.5px;padding:2px 16px 10px}
-.scroll{overflow:auto;max-height:520px}
-.acct-grid{display:flex;gap:12px;flex-wrap:wrap;padding:0 16px 16px}
-.acct{flex:1;min-width:290px;border:1px solid #eef0f4;border-radius:12px;padding:14px}
-.acct h4{margin:0 0 4px;font-size:15px}
-.acct .uid{color:#9aa0aa;font-size:11.5px;font-family:ui-monospace,Consolas,monospace;
-           word-break:break-all;margin-bottom:10px}
-.kv{display:flex;justify-content:space-between;gap:10px;padding:6px 0;
-    border-bottom:1px dashed #f2f3f7;font-size:13px}
-.kv:last-child{border-bottom:0}
-.kv span{color:#8b8f99;white-space:nowrap}
-.kv b{font-weight:600;text-align:right}
-.empty{color:#9aa0aa;font-size:13.5px;padding:16px}
-.foot{color:#9aa0aa;font-size:12px;margin-top:18px;line-height:1.8}
-.tag{display:inline-block;padding:1px 7px;border-radius:8px;font-size:11.5px;
-     background:#f1f0ff;color:#6a5cf5;margin-left:6px}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"PingFang SC",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
 """
+
+# 防闪白：主题要在 <head> 里、样式之前定下来（和 static/theme.js 逻辑一致）
+THEME_BOOT_JS = """
+(function(){try{var k='wb-theme',v=localStorage.getItem(k);
+if(!v){v=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}
+document.documentElement.setAttribute('data-theme',v);
+document.documentElement.style.colorScheme=v;}catch(e){
+document.documentElement.setAttribute('data-theme','light');}})();
+"""
+
+THEME_BTN = ('<button type="button" class="themebtn" id="wb-theme-btn" '
+             'onclick="wbToggleTheme()" title="切换主题">'
+             '<span class="ico" id="wb-theme-ico">☾</span>'
+             '<span id="wb-theme-label">夜晚</span></button>')
+
+
+def _strip_css_comments(css):
+    """内联前剥掉 CSS 注释：注释是给人看的，内联进每个页面纯属浪费字节。"""
+    import re as _re
+    out = _re.sub(r"/\*.*?\*/", "", css, flags=_re.S)
+    out = _re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _theme_css():
+    return _strip_css_comments(_read_static("theme.css")) or _FALLBACK_CSS
+
+
+def _theme_js():
+    return _read_static("theme.js")
+
+
+# 图表用色统一从主题变量取，写死颜色会导致深色模式下看不见
+C_GRID = "var(--grid)"
+C_LINE = "var(--chart-line)"
+C_BAR = "var(--chart-bar)"
+C_SPARK_HI = "var(--spark-hi)"
+C_SPARK_LO = "var(--spark-lo)"
+C_MUT = "var(--mut2)"
+C_AX_L = "var(--acc)"
+C_AX_R = "var(--ok)"
 
 
 def _is_ok(a):
@@ -505,14 +512,14 @@ def render_streak_block(last, runs=None):
     旧归档没有这些字段，一律降级显示 "—"。
     """
     if not last:
-        return '<div class="empty">暂无连登数据。等下一次运行后即可看到。</div>'
+        return '<div class="trim">暂无连登数据。等下一次运行后即可看到。</div>'
     accts = last.get("accounts") or []
     if not accts:
-        return '<div class="empty">暂无连登数据。</div>'
+        return '<div class="trim">暂无连登数据。</div>'
     has_any = any(a.get("streak_days") is not None or a.get("makeup_cards") or
                   a.get("redeem_summary") for a in accts)
     if not has_any:
-        return ('<div class="empty">最近一次运行还没有连登数据'
+        return ('<div class="trim">最近一次运行还没有连登数据'
                 '（接口未返回或已按 WB_GROWTH=0 跳过）。</div>')
 
     runs = runs or [last]
@@ -595,8 +602,8 @@ def _mini_bars(days, width=260, height=46):
         h = max(1.0, (v["credit"] / mx) * (height - 12))
         x = i * (bw + gap)
         y = height - h - 10
-        # 最高的一天用主色，其余浅色
-        fill = "#6a5cf5" if v["credit"] == mx else "#c9c3ff"
+        # 最高的一天用主色，其余浅色（都走主题变量，深色模式下自动换色）
+        fill = C_SPARK_HI if v["credit"] == mx else C_SPARK_LO
         bars.append(
             '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2" fill="%s">'
             '<title>%s · %s</title></rect>' % (x, y, bw, h, fill,
@@ -605,10 +612,10 @@ def _mini_bars(days, width=260, height=46):
     last = (vals[-1].get("date") or "")[5:]
     return ('<svg class="spark" viewBox="0 0 %d %d" width="%d" height="%d" '
             'preserveAspectRatio="none" role="img">%s'
-            '<text x="0" y="%d" font-size="9" fill="#a7abb3">%s</text>'
-            '<text x="%d" y="%d" font-size="9" fill="#a7abb3" text-anchor="end">%s</text>'
+            '<text x="0" y="%d" font-size="9" fill="%s">%s</text>'
+            '<text x="%d" y="%d" font-size="9" fill="%s" text-anchor="end">%s</text>'
             '</svg>') % (width, height, width, height, "".join(bars),
-                         height, first, width, height, last)
+                         height, C_MUT, first, width, height, C_MUT, last)
 
 
 def render_usage_block(last):
@@ -622,14 +629,14 @@ def render_usage_block(last):
     旧归档没有这些字段，一律降级显示 "—"。
     """
     if not last:
-        return '<div class="empty">暂无用量数据。等下一次运行后即可看到。</div>'
+        return '<div class="trim">暂无用量数据。等下一次运行后即可看到。</div>'
     accts = last.get("accounts") or []
     if not accts:
-        return '<div class="empty">暂无用量数据。</div>'
+        return '<div class="trim">暂无用量数据。</div>'
     has_any = any(a.get("usage_days") or a.get("usage_today") is not None
                   for a in accts)
     if not has_any:
-        return ('<div class="empty">最近一次运行还没有用量数据'
+        return ('<div class="trim">最近一次运行还没有用量数据'
                 '（接口未返回或已按 WB_USAGE=0 跳过）。</div>')
 
     # ---- 顶部 KPI（多账号求和）
@@ -732,45 +739,16 @@ def render_report(h, days=30, tasks=None, daily=True):
     if last:
         sm = last.get("summary") or {}
         n_ok = sum(1 for a in (last.get("accounts") or []) if _is_ok(a) is True)
+        n_tot = len(last.get("accounts") or [])
         cards = [
             ("今日获取", ("+%g" % round(sm.get("diff") or 0, 2)) if sm.get("diff") else "+0"),
             ("账户总余额", ("%.2f" % sm["after"]) if sm.get("after") is not None else "—"),
-            ("账号数", "%d（成功 %d）" % (len(last.get("accounts") or []), n_ok)),
+            ("账号数", "%d（成功 %d）" % (n_tot, n_ok)),
         ]
+        verdict_line = "签到成功 %d/%d 个账号" % (n_ok, n_tot)
     else:
         cards = [("今日获取", "—"), ("账户总余额", "—"), ("账号数", "—")]
-
-    # ---- 账号卡（用最近一次的数据）
-    acct_cards = []
-    if last:
-        for a in last.get("accounts") or []:
-            ok = _is_ok(a)
-            rows = [
-                ("签到状态", a.get("checkin") or "-"),
-                ("本次积分", ("+%g" % round(a.get("diff") or 0, 2)) if a.get("diff") else "+0"),
-                ("连续天数", _streak_text(a)),
-                ("余额", ("%.2f" % a["after"]) if a.get("after") is not None else "-"),
-                ("套餐", ("%.2f" % a["tc"]) if a.get("tc") is not None else "-"),
-                ("购买", ("%.2f" % a["buy"]) if a.get("buy") is not None else "-"),
-                ("平台奖励", ("%.2f" % a["rw"]) if a.get("rw") is not None else "-"),
-            ]
-            cls = "ok" if ok else "fail"
-            if ok is True:
-                tag_bg, tag_txt = "#e8f7f0", "已签到"
-            elif ok is False:
-                tag_bg, tag_txt = "#fdecee", "未成功"
-            else:
-                tag_bg, tag_txt = "#f3f4f7", "状态未知"
-            acct_cards.append(
-                '<div class="acct"><h4>%s <span class="tag" style="background:%s">%s</span></h4>'
-                '<div class="uid">%s</div>%s</div>' % (
-                    html.escape(a.get("name") or "账号"),
-                    tag_bg, tag_txt,
-                    html.escape(a.get("uid") or "-"),
-                    "".join('<div class="kv"><span>%s</span><b>%s</b></div>'
-                            % (html.escape(k), html.escape(str(v))) for k, v in rows)))
-    acct_html = ('<div class="acct-grid">%s</div>' % "".join(acct_cards)) if acct_cards \
-        else '<div class="empty">暂无记录。先跑一次 QD 任务，再执行 wb_report.py 同步。</div>'
+        verdict_line = "暂无运行记录"
 
     # ---- 账号 × 日期矩阵（日期在行、账号在列，更符合「看历史」的直觉）
     dates, cells, names = build_matrix(runs)
@@ -848,20 +826,55 @@ def render_report(h, days=30, tasks=None, daily=True):
     # ---- Token / 积分消耗（只读采集，纯离线渲染）
     usage_html = render_usage_block(last)
 
+    # 账号卡状态标签：用主题变量，别写死颜色
+    def _tag(ok):
+        if ok is True:
+            return "var(--ok-bg)", "var(--ok)", "已签到"
+        if ok is False:
+            return "var(--bad-bg)", "var(--bad)", "未成功"
+        return "var(--card2)", "var(--mut2)", "状态未知"
+
+    acct_cards = []
+    if last:
+        for a in last.get("accounts") or []:
+            ok = _is_ok(a)
+            kv = [
+                ("签到状态", a.get("checkin") or "-"),
+                ("本次积分", ("+%g" % round(a.get("diff") or 0, 2)) if a.get("diff") else "+0"),
+                ("连续天数", _streak_text(a)),
+                ("余额", ("%.2f" % a["after"]) if a.get("after") is not None else "-"),
+                ("套餐", ("%.2f" % a["tc"]) if a.get("tc") is not None else "-"),
+                ("购买", ("%.2f" % a["buy"]) if a.get("buy") is not None else "-"),
+                ("平台奖励", ("%.2f" % a["rw"]) if a.get("rw") is not None else "-"),
+            ]
+            tag_bg, tag_fg, tag_txt = _tag(ok)
+            acct_cards.append(
+                '<div class="acct"><h4>%s <span class="tag" style="background:%s;color:%s">%s</span></h4>'
+                '<div class="uid">%s</div>%s</div>' % (
+                    html.escape(a.get("name") or "账号"),
+                    tag_bg, tag_fg, tag_txt,
+                    html.escape(a.get("uid") or "-"),
+                    "".join('<div class="kv"><span>%s</span><b>%s</b></div>'
+                            % (html.escape(k), html.escape(str(v))) for k, v in kv)))
+    acct_html = ('<div class="acct-grid">%s</div>' % "".join(acct_cards)) if acct_cards \
+        else '<div class="trim">暂无记录。先在控制台跑一次，再回来看。</div>'
+
+
     n_acct = len(acct_cols)
     n_run = len(runs)
     span = ("%s ~ %s" % (show_dates[0], show_dates[-1])) if show_dates else "—"
 
     return """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="zh-CN" data-theme="light"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy 多账号签到报告</title>
+<script>%s</script>
 <style>%s</style></head>
 <body><div class="wrap">
   <h1>WorkBuddy 多账号签到报告</h1>
   <div class="meta">生成于 %s ｜ 数据区间 %s ｜ %d 天 %d 次运行 ｜ %d 个账号</div>
   <div class="hero">
-    <h2>最近一次运行</h2>
+    <h2>最近一次运行 <span style="float:right;font-size:13px;font-weight:400;opacity:.9">%s</span></h2>
     <div class="t">%s</div>
   </div>
   <div class="cards">%s</div>
@@ -871,7 +884,8 @@ def render_report(h, days=30, tasks=None, daily=True):
   </div>
   <div class="panel">
     <h3>连登状态<span class="sub" style="padding:0 0 0 6px">最近一次</span></h3>
-    <div class="sub">「连续登录」= 连续登录且使用 WorkBuddy 的天数。档位：入门 7 天 / 进阶 14 天 / 巅峰 28 天，每档每月限兑 1 次。</div>
+    <div class="sub">「连续登录」= 连续登录<b>且使用</b> WorkBuddy 的天数 —— 所以它需要你本人发一次对话才会推进。
+      档位：入门 7 天 / 进阶 14 天 / 巅峰 28 天，每档每月限兑 1 次。</div>
     %s
   </div>
   <div class="panel">
@@ -896,12 +910,14 @@ def render_report(h, days=30, tasks=None, daily=True):
     数据来源：本地归档 <code>data/wb_history.json</code>。<br>
     本页由 <code>wb_report.py</code> 生成，纯静态、无外部依赖、无网络调用。页面内不含任何 token。
   </div>
-</div></body></html>
-""" % (CSS, now, span, len(show_dates), n_run, n_acct,
+</div><script>%s</script></body></html>
+""" % (THEME_BOOT_JS, _theme_css(), now, span, len(show_dates), n_run, n_acct,
        html.escape(last.get("ts") if last else "暂无运行记录"),
-       "".join('<div class="card"><div class="v">%s</div><div class="k">%s</div></div>'
+       html.escape(verdict_line),
+       "".join('<div class="mcard"><div class="v">%s</div><div class="k">%s</div></div>'
                % (html.escape(v), html.escape(k)) for k, v in cards),
-       acct_html, streak_html, usage_html, matrix_html, chart_html, detail_html)
+       acct_html, streak_html, usage_html, matrix_html, chart_html, detail_html,
+       _theme_js())
 
 
 def render_chart(daily):
@@ -912,7 +928,7 @@ def render_chart(daily):
     单看积分增量会把图压成一条 0 基线（因为每天通常就 0~10 分），所以余额当主线。
     """
     if not daily:
-        return '<div class="empty">暂无足够数据画图。</div>'
+        return '<div class="trim">暂无足够数据画图。</div>'
     W, H, PL, PR, PT, PB = 1000, 260, 56, 56, 20, 40
     iw, ih = W - PL - PR, H - PT - PB
     n = len(daily)
@@ -945,16 +961,16 @@ def render_chart(daily):
     for k in range(3):
         v = blo + (bhi - blo) * k / 2.0
         y = YB(v)
-        parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#eef0f4" stroke-width="1"/>'
-                     % (PL, y, W - PR, y))
-        parts.append('<text x="%d" y="%.1f" font-size="11" fill="#8f7bff" text-anchor="end">%.2f</text>'
-                     % (PL - 8, y + 4, v))
+        parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1"/>'
+                     % (PL, y, W - PR, y, C_GRID))
+        parts.append('<text x="%d" y="%.1f" font-size="11" fill="%s" text-anchor="end">%.2f</text>'
+                     % (PL - 8, y + 4, C_AX_L, v))
     # 右轴（积分）刻度
     for k in range(3):
         v = clo + (chi - clo) * k / 2.0
         y = YC(v)
-        parts.append('<text x="%d" y="%.1f" font-size="11" fill="#17a673" text-anchor="start">%g</text>'
-                     % (W - PR + 8, y + 4, v))
+        parts.append('<text x="%d" y="%.1f" font-size="11" fill="%s" text-anchor="start">%g</text>'
+                     % (W - PR + 8, y + 4, C_AX_R, v))
 
     # 柱：当日积分
     bw = max(3.0, min(26.0, dx * 0.45)) if n > 1 else 18.0
@@ -964,32 +980,32 @@ def render_chart(daily):
         y0 = YC(clo)
         if y0 - y < 1.4:
             y = y0 - 1.4   # 让 0 也有一个可见的小方块，避免"什么都没有"
-        parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2" fill="#17a673" opacity="0.75"/>'
-                     % (X(i) - bw / 2, y, bw, max(1.4, y0 - y)))
+        parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2" fill="%s" opacity="0.75"/>'
+                     % (X(i) - bw / 2, y, bw, max(1.4, y0 - y), C_BAR))
 
     # 折线：余额
     if bals:
         poly = " ".join("%.1f,%.1f" % (X(i), YB(b))
                         for i, (_, _, b) in enumerate(daily) if b is not None)
-        parts.append('<path d="M %s" fill="none" stroke="#6a5cf5" stroke-width="2.2" '
-                     'stroke-linejoin="round"/>' % poly)
+        parts.append('<path d="M %s" fill="none" stroke="%s" stroke-width="2.2" '
+                     'stroke-linejoin="round"/>' % (poly, C_LINE))
         for i, (_, _, b) in enumerate(daily):
             if b is None:
                 continue
-            parts.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="#fff" stroke="#6a5cf5" '
-                         'stroke-width="2"/>' % (X(i), YB(b), 3.2 if n <= 40 else 2.2))
+            parts.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="var(--card)" stroke="%s" '
+                         'stroke-width="2"/>' % (X(i), YB(b), 3.2 if n <= 40 else 2.2, C_LINE))
 
     # x 轴标签（最多 10 个）
     step = max(1, (n + 9) // 10)
     for i in range(0, n, step):
-        parts.append('<text x="%.1f" y="%d" font-size="11" fill="#9aa0aa" text-anchor="middle">%s</text>'
-                     % (X(i), H - 14, html.escape((daily[i][0] or "")[5:])))
+        parts.append('<text x="%.1f" y="%d" font-size="11" fill="%s" text-anchor="middle">%s</text>'
+                     % (X(i), H - 14, C_MUT, html.escape((daily[i][0] or "")[5:])))
 
     legend = (
-        '<div style="display:flex;gap:18px;padding:0 16px 10px;font-size:12.5px;color:#8b8f99">'
-        '<span><span style="display:inline-block;width:18px;height:3px;background:#6a5cf5;'
+        '<div style="display:flex;gap:18px;padding:0 16px 10px;font-size:12.5px;color:var(--mut)">'
+        '<span><span style="display:inline-block;width:18px;height:3px;background:var(--chart-line);'
         'vertical-align:middle;margin-right:6px"></span>账户总余额（左轴）</span>'
-        '<span><span style="display:inline-block;width:11px;height:11px;background:#17a673;'
+        '<span><span style="display:inline-block;width:11px;height:11px;background:var(--chart-bar);'
         'opacity:.75;vertical-align:middle;margin-right:6px;border-radius:2px"></span>'
         '当日积分合计（右轴）</span></div>')
     return (legend + '<div style="overflow:auto"><svg viewBox="0 0 %d %d" width="100%%" '

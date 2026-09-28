@@ -19,9 +19,14 @@ ENV TZ=Asia/Shanghai \
 WORKDIR /app
 
 # 只拷贝运行需要的文件（.dockerignore 已排除 .env / 开发残留）
-COPY wb_daily.py wb_report.py app.py /app/
+COPY wb_daily.py wb_report.py notify.py app.py /app/
 COPY deploy/ /app/deploy/
 COPY static/ /app/static/
+
+# 把构建时的 commit 写进镜像 —— 飞牛镜像管理只比 tag（我们全用 :latest），
+# 不会提示更新；控制台「更新」页靠这个文件和 GitHub HEAD 比对来判断。
+ARG WB_REVISION=dev
+RUN echo "$WB_REVISION" > /app/WB_REVISION
 
 RUN chmod +x /app/deploy/*.sh \
  && addgroup -g 1000 -S wb \
