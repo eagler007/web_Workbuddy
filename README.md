@@ -12,16 +12,22 @@
 
 ## 快速开始
 
+镜像由 **GitHub Actions 自动构建**并推送到 GHCR，使用方**不需要本地 build**：
+
 ```bash
-cd docker
+mkdir -p /vol1/docker/workbuddy && cd /vol1/docker/workbuddy
+# 放入 docker-compose.yml（从 docker/docker-compose.yml 复制）
 cp .env.example .env
 python3 -c "import secrets;print(secrets.token_hex(32))"   # 生成 WEB_SECRET
 vi .env                     # 填 WEB_PASSWORD 和 WEB_SECRET
-docker build -t wb-daily:latest .
+chmod 600 .env
+docker compose pull
 docker compose up -d
 ```
 
 打开 `http://<主机IP>:18080/` → 登录 → 「账号」页添加你的 WorkBuddy 账号。
+
+> 完整步骤（含把镜像设为 public、飞牛 Web 界面导入 compose）：[`飞牛部署.md`](飞牛部署.md)
 
 ---
 
@@ -38,9 +44,11 @@ docker compose up -d
 
 ```
 .
+├── .github/workflows/
+│   └── docker-publish.yml      push 后自动构建镜像并推送到 ghcr.io
 ├── docker/
 │   ├── Dockerfile              镜像定义（python:3.12-alpine + tini + tzdata + supercronic）
-│   ├── docker-compose.yml      单服务编排（18080 → 8080，data 卷）
+│   ├── docker-compose.yml      单服务编排（18080 → 8080，data 卷，image 走 GHCR）
 │   ├── .env.example            环境变量模板
 │   ├── .dockerignore           构建排除（含 .env，绝不进镜像）
 │   ├── app.py                  Web 控制台（标准库 ThreadingHTTPServer）

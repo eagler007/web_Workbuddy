@@ -12,30 +12,38 @@
 
 ## 一、30 秒上手
 
+**镜像已经在 GitHub 上构建好了**（由 GitHub Actions 自动构建推送），飞牛只需要拉取，**不用本地 build，也不用装 Docker 开发环境**。
+
 ```bash
-# 1. 上传本目录到飞牛
-#    假设放到 /vol1/docker/workbuddy/
+# 1. 在飞牛上建部署目录
+mkdir -p /vol1/docker/workbuddy
 cd /vol1/docker/workbuddy
 
-# 2. 准备环境变量
+# 2. 把 docker-compose.yml 放进来
+#    方式 A：飞牛 Web → Docker → Compose → 新增项目
+#            路径填 /vol1/docker/workbuddy，来源选「创建 docker-compose.yml」，
+#            把本目录 docker-compose.yml 的内容粘进去，勾选「创建后立即启动」
+#    方式 B：命令行
+#            curl -fsSL -o docker-compose.yml \
+#              https://raw.githubusercontent.com/eagler007/web_Workbuddy/main/docker/docker-compose.yml
+
+# 3. 准备环境变量
 cp .env.example .env
 python3 -c "import secrets;print(secrets.token_hex(32))"   # 复制输出
 vi .env        # 填 WEB_PASSWORD 和 WEB_SECRET
 chmod 600 .env
 
-# 3. 构建镜像（飞牛 Web 导入 compose 时 build: 不生效，必须先 build）
-docker build -t wb-daily:latest .
-
 # 4. 数据目录 + 权限（容器内跑的是 uid 1000）
 mkdir -p /vol1/docker/workbuddy/data
 chown -R 1000:1000 /vol1/docker/workbuddy/data
 
-# 5. 启动
+# 5. 拉镜像并启动
+docker compose pull
 docker compose up -d
 docker compose logs -f --tail=50
 ```
 
-打开 **http://localhost:18080/** → 输 `WEB_PASSWORD` → 「账号」页加账号。
+打开 **http://<NAS-IP>:18080/** → 输 `WEB_PASSWORD` → 「账号」页加账号。
 
 > 要换端口就改 `docker-compose.yml` 里的 `ports`。
 
@@ -118,10 +126,12 @@ docker compose restart                     # 重启
 docker compose exec workbuddy date         # 【验证时区，必须显示 CST +0800】
 docker compose exec workbuddy /app/deploy/run_daily.sh   # 不等定时，手动触发一次
 docker compose exec workbuddy /app/deploy/run_report.sh  # 只重渲染报告
-docker compose down && docker compose up -d --build      # 改代码后重建
+docker compose pull && docker compose up -d              # 拉最新镜像并重启
 ```
 
 **改定时**：编辑 `.env` 里的 `CRON_SCHEDULE`（cron 五段式，如 `0 8,20 * * *`），然后 `docker compose up -d` 重启生效。
+
+**改代码/更新版本**：本地改完 `git push` → GitHub Actions 自动构建新镜像（约 2–4 分钟）→ 飞牛上 `docker compose pull && docker compose up -d`。
 
 ---
 
@@ -131,7 +141,7 @@ docker compose down && docker compose up -d --build      # 改代码后重建
 2. **`.env` 里不要设 `WB_ACCOUNTS_JSON`**。它的优先级高于账号文件，一旦设置会把 Web 加的账号全遮蔽掉。
 3. **报告文件分了两个**（`report.html` 聚合 / `report_single.html` 单次），别混用，否则互相覆盖。
 4. **卷权限**。容器以 uid 1000 跑，宿主 `data/` 目录要 `chown 1000:1000`，否则写报告会失败。
-5. **飞牛 Web 导入 compose 时 `build:` 不生效**，必须先在 SSH 里 `docker build`。
+5. **镜像走 GHCR，飞牛不用 build**。飞牛 Web 导入 compose 时**不执行 `build:` 段**，所以本项目把构建放到 GitHub Actions（见 `.github/workflows/docker-publish.yml`），compose 里只写 `image:`。要改代码就 push，等 Actions 构建完再 `docker compose pull`。
 6. **签到失败先看响应体**。接口返回 400 且 body 是 `{"code":10001,"msg":"今天已签到，请明天再来"}` 属于**正常**（今天已经签过了），不是故障。
 7. **派猫顺序是「先领后派」**。脚本已经按这个顺序写死：`arrived` 才领，领完重读状态，`idle` 且没到当日上限才派。别改成先派。
 8. **猫猫出错不影响签到结论**。整条猫链路包在 try/except 里，退出码只看签到。
@@ -157,7 +167,7 @@ docker compose down && docker compose up -d --build      # 改代码后重建
 ```
 docker/
 ├── Dockerfile                 镜像定义（python:3.12-alpine + tini + tzdata + supercronic）
-├── docker-compose.yml         单服务编排（18080 → 8080，data 卷）
+├── docker-compose.yml         单服务编排（18080 → 8080，data 卷，image 走 GHCR）
 ├── .env.example               环境变量模板
 ├── .dockerignore              构建排除（含 .env，绝不进镜像）
 ├── app.py                     Web 控制台（标准库 ThreadingHTTPServer）
@@ -169,4 +179,8 @@ docker/
 │   └── run_report.sh          只渲染报告
 └── static/
     └── style.css              预留（样式目前内联在 app.py）
+
+.github/
+└── workflows/
+    └── docker-publish.yml     push 后自动构建并推送到 ghcr.io
 ```

@@ -1,14 +1,23 @@
 # WorkBuddy 每日助手 —— compose 定义
 #
-# 用法（在飞牛 SSH 里，本文件所在目录执行）：
-#   docker compose up -d
-#   docker compose logs -f --tail=50
+# 镜像从 GitHub Container Registry 拉取（无需本地 build）。
+# 构建由 GitHub Actions 自动完成，见仓库 .github/workflows/docker-publish.yml
 #
-# 注意：飞牛 Web 界面导入 compose 时 build: 不生效，
-#       所以先 `docker build -t wb-daily:latest .` 再 up。
+# 用法（飞牛 Web → Docker → Compose → 新增项目，粘贴本文件内容）：
+#   名称：workbuddy
+#   路径：/vol1/docker/workbuddy
+#   来源：创建 docker-compose.yml（粘贴）
+#   ☑ 创建项目后立即启动
+#
+# 或命令行：
+#   docker compose pull && docker compose up -d
+#
+# 更新到最新镜像：
+#   docker compose pull && docker compose up -d
 services:
   workbuddy:
-    image: wb-daily:latest
+    # 镜像由 GitHub Actions 自动构建推送；飞牛只需 pull
+    image: ghcr.io/eagler007/web_workbuddy:latest
     container_name: workbuddy
     restart: unless-stopped
     env_file:
@@ -19,12 +28,12 @@ services:
       WEB_HOST: 0.0.0.0
       WEB_PORT: "8080"
     ports:
-      # 宿主 18080 → 容器 8080（192.168.2.12 的 8080 已被占用，实测 18080 空闲）
-      # 打开：http://192.168.2.12:18080/
+      # 宿主 18080 → 容器 8080（宿主 8080 常被占用，实测 18080 空闲）
+      # 打开：http://<NAS-IP>:18080/
       - "18080:8080"
     volumes:
       # 所有数据/报告/账号都落在这里；换机器时把这个目录拷走即可
-      - /vol1/docker/workbuddy/data:/data
+      - ./data:/data
     healthcheck:
       test: ["CMD", "python3", "-c",
              "import urllib.request,os,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=4).status==200 else 1)"]

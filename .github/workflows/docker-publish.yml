@@ -1,0 +1,62 @@
+name: Build and Push to GHCR
+
+# 自动构建容器镜像并推送到 GitHub Container Registry (ghcr.io)
+#
+# 触发时机：
+#   - push 到 main 且改动了 docker/ 下的文件
+#   - 也可以在 Actions 页面手动点 "Run workflow"（workflow_dispatch）
+#
+# 产物：ghcr.io/<owner>/<repo>:latest  和  :<commit-sha>
+# 构建完成后，Dockerfile 里的构建上下文就是 docker/ 子目录。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-publish.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read    # 拉取代码
+      packages: write   # 推送到 GHCR —— 必需
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # GHCR 的镜像名必须全小写，而 GitHub 用户名可能含大写
+      - name: Lowercase image name
+        id: img
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # 自动注入，无需额外 secret
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker                  # 构建上下文 = 仓库里的 docker/ 目录
+          file: docker/Dockerfile          # Dockerfile 路径（相对仓库根）
+          push: true
+          # 飞牛的 Intel/AMD 机器是 x86_64，只构 amd64 省额度
+          platforms: linux/amd64
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:${{ github.sha }}
+          # 构建缓存，加速后续构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
