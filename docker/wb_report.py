@@ -343,6 +343,28 @@ td.ok{color:#17a673;font-weight:600}
 td.fail{color:#e34d59;font-weight:600}
 td.credit{color:#17a673;font-weight:600}
 td.credit.zero{color:#a7abb3}
+td.ok{color:#17a673;font-weight:600}
+td.bad{color:#e34d59;font-weight:600}
+td.na{color:#a7abb3}
+.st{display:inline-block;padding:1px 8px;border-radius:9px;font-size:12px;
+    font-weight:600;white-space:nowrap}
+.st.ok{background:#e8f7f0;color:#17a673}
+.st.warn{background:#fff5e6;color:#d98600}
+.st.bad{background:#fdecee;color:#e34d59}
+.st.na{background:#f2f3f7;color:#9aa0aa}
+/* ---- Token / 积分消耗面板 ---- */
+.ucard{display:inline-block;min-width:150px;margin:0 10px 12px 16px;padding:12px 14px;
+       background:#f8f8fc;border-radius:12px;vertical-align:top}
+.ucard .uv{font-size:22px;font-weight:700;color:#1f2329}
+.ucard .uk{color:#8b8f99;font-size:12px;margin-top:2px}
+.ucard .us{color:#a7abb3;font-size:11.5px;margin-top:3px}
+.uspark{margin:4px 16px 14px}
+.uspark .uslabel{color:#8b8f99;font-size:12px;margin-bottom:6px}
+svg.spark{display:block;overflow:visible}
+.mutd{color:#c3c7cd}
+.unote{color:#8b8f99;font-size:12px;line-height:1.7;padding:2px 16px 14px}
+.unote strong{color:#6a5cf5}
+.uerr{color:#e34d59;font-size:12.5px;padding:2px 16px 10px}
 .scroll{overflow:auto;max-height:520px}
 .acct-grid{display:flex;gap:12px;flex-wrap:wrap;padding:0 16px 16px}
 .acct{flex:1;min-width:290px;border:1px solid #eef0f4;border-radius:12px;padding:14px}
@@ -441,11 +463,45 @@ def _streak_text(a):
     return "%s 天" % v
 
 
-def render_streak_block(last):
+def _streak_today(runs, name, cur_days):
+    """判断「今天这一次运行有没有把连登天数推进」。
+
+    做法：在同一账号的历史里找上一次记录的连登天数，和当前值比。
+      cur > prev  → 已计入（+N 天）
+      cur == prev → 今天还没计入（连登天数没动）—— 这是要提醒老板的信号
+      cur < prev  → 跨月清零 / 断登过，单独标注
+    返回 (状态文案, 类型)，类型 ∈ {"ok","warn","bad","na"}。
+    """
+    if cur_days is None:
+        return "—", "na"
+    prev = None
+    # runs 是按时间升序的，最后一个就是「当前」这一次，从倒数第二个往前找
+    for r in reversed(runs[:-1]):
+        for a in (r.get("accounts") or []):
+            if (a.get("name") or "") == name:
+                v = a.get("streak_days")
+                if v is None:
+                    v = a.get("streak")
+                if v is not None:
+                    prev = int(v)
+                    break
+        if prev is not None:
+            break
+    if prev is None:
+        return "首次记录", "na"
+    if cur_days > prev:
+        return "已计入（+%d）" % (cur_days - prev), "ok"
+    if cur_days == prev:
+        return "尚未计入", "warn"
+    return "已清零（上次 %d）" % prev, "warn"
+
+
+def render_streak_block(last, runs=None):
     """「连登状态」区块。纯离线：只读归档字段，不发任何网络请求。
 
-    数据来自 wb_daily.py 阶段 A 采集并写入 accounts[] 的：
-      streak_days / streak_next_tier / makeup_cards / makeup_dates / redeem_summary
+    数据来自 wb_daily.py 采集并写入 accounts[] 的：
+      streak_days / streak_next_tier / makeup_cards / makeup_dates
+      redeem_summary / redeem_text / redeem_todo
     旧归档没有这些字段，一律降级显示 "—"。
     """
     if not last:
@@ -459,22 +515,22 @@ def render_streak_block(last):
         return ('<div class="empty">最近一次运行还没有连登数据'
                 '（接口未返回或已按 WB_GROWTH=0 跳过）。</div>')
 
+    runs = runs or [last]
+
     # 档位中文名：前端定义 starter/advanced/legendary → 7d/14d/28d
     tier_name = {"7d": "入门档", "14d": "进阶档", "28d": "巅峰档"}
-    tier_key = {"7d": "starter", "14d": "advanced", "28d": "legendary"}
 
     rows = ['<div class="scroll"><table><thead><tr>'
-            '<th style="text-align:left">账号</th><th>当前连登</th><th>下一档</th>'
-            '<th>补登卡</th><th>本月已兑</th></tr></thead><tbody>']
+            '<th style="text-align:left">账号</th><th>当前连登</th>'
+            '<th>今日是否计入</th><th>下一档</th>'
+            '<th>补登卡</th><th>本月已兑</th><th>本次兑换</th>'
+            '</tr></thead><tbody>']
     for a in accts:
+        nm = a.get("name") or mask(a.get("uid"))
         d = a.get("streak_days")
         nt = a.get("streak_next_tier")
-        if d is None:
-            d_txt = "—"
-        else:
-            d_txt = "%s 天" % d
+        d_txt = "—" if d is None else "%s 天" % d
         if nt:
-            nxt = nt if nt in tier_name else str(nt)
             nxt_txt = "%s（%s）" % (tier_name.get(nt, nt), nt)
         else:
             nxt_txt = "已达最高档" if d is not None else "—"
@@ -486,20 +542,177 @@ def render_streak_block(last):
         rs = a.get("redeem_summary") or {}
         if rs:
             got = []
-            for tk, cn, tv in (("starter", "入门", "7d"), ("advanced", "进阶", "14d"),
-                               ("legendary", "巅峰", "28d")):
+            for tk, cn in (("starter", "入门"), ("advanced", "进阶"),
+                           ("legendary", "巅峰")):
                 if rs.get(tk):
                     got.append("%s×%s" % (cn, rs[tk]))
             rs_txt = "、".join(got) if got else "均未兑"
         else:
             rs_txt = "—"
+
+        # 本次兑换结果（阶段 B）
+        rt = a.get("redeem_text")
+        r_ok = a.get("redeem_ok")
+        if rt is None:
+            act_txt, act_cls = "—", "na"
+        elif r_ok is False:
+            act_txt, act_cls = rt, "bad"
+        elif rt.startswith("跳过"):
+            act_txt, act_cls = rt, "na"
+        else:
+            act_txt, act_cls = rt, "ok"
+
+        # 今日是否计入（跟历史对比）
+        today_txt, today_cls = _streak_today(runs, nm, d)
+
         rows.append(
-            "<tr><td class='acc'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-            % (html.escape(a.get("name") or mask(a.get("uid"))),
-               html.escape(d_txt), html.escape(nxt_txt),
-               html.escape(cards_txt), html.escape(rs_txt)))
+            "<tr><td class='acc'>%s</td><td>%s</td>"
+            "<td><span class='st %s'>%s</span></td>"
+            "<td>%s</td><td>%s</td><td>%s</td><td class='%s'>%s</td></tr>"
+            % (html.escape(nm), html.escape(d_txt),
+               today_cls, html.escape(today_txt),
+               html.escape(nxt_txt), html.escape(cards_txt),
+               html.escape(rs_txt), act_cls, html.escape(act_txt)))
     rows.append("</tbody></table></div>")
     return "".join(rows)
+
+
+def _mini_bars(days, width=260, height=46):
+    """把 [{date,credit}] 画成一条自包含的迷你柱状图（纯 SVG 内联，无外部依赖）。
+
+    柱高按窗口内最大值归一；无数据的日期留空格子。
+    返回 SVG 字符串；数据为空时返回空串。
+    """
+    vals = [d for d in (days or []) if d.get("credit") is not None]
+    if not vals:
+        return ""
+    mx = max(v["credit"] for v in vals) or 1
+    n = len(vals)
+    gap = 2
+    bw = max(3.0, (width - gap * (n - 1)) / float(n))
+    bars = []
+    for i, v in enumerate(vals):
+        h = max(1.0, (v["credit"] / mx) * (height - 12))
+        x = i * (bw + gap)
+        y = height - h - 10
+        # 最高的一天用主色，其余浅色
+        fill = "#6a5cf5" if v["credit"] == mx else "#c9c3ff"
+        bars.append(
+            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2" fill="%s">'
+            '<title>%s · %s</title></rect>' % (x, y, bw, h, fill,
+                                               v.get("date") or "", v["credit"]))
+    first = (vals[0].get("date") or "")[5:]
+    last = (vals[-1].get("date") or "")[5:]
+    return ('<svg class="spark" viewBox="0 0 %d %d" width="%d" height="%d" '
+            'preserveAspectRatio="none" role="img">%s'
+            '<text x="0" y="%d" font-size="9" fill="#a7abb3">%s</text>'
+            '<text x="%d" y="%d" font-size="9" fill="#a7abb3" text-anchor="end">%s</text>'
+            '</svg>') % (width, height, width, height, "".join(bars),
+                         height, first, width, height, last)
+
+
+def render_usage_block(last):
+    """「Token / 积分消耗」区块。纯离线：只读归档字段。
+
+    字段来自 wb_daily.py 的 usage_flow() 写入 accounts[] 的：
+      usage_today / usage_days / usage_sum / usage_range / usage_err
+    口径提醒（前端文案原文）：
+      - 这里的 credit 是**积分消耗**（模型调用按系数扣积分），不是原始 token 数。
+      - 「用量数据存在 2-3 小时的数据延迟」→ 当天为 0 / 空是正常的。
+    旧归档没有这些字段，一律降级显示 "—"。
+    """
+    if not last:
+        return '<div class="empty">暂无用量数据。等下一次运行后即可看到。</div>'
+    accts = last.get("accounts") or []
+    if not accts:
+        return '<div class="empty">暂无用量数据。</div>'
+    has_any = any(a.get("usage_days") or a.get("usage_today") is not None
+                  for a in accts)
+    if not has_any:
+        return ('<div class="empty">最近一次运行还没有用量数据'
+                '（接口未返回或已按 WB_USAGE=0 跳过）。</div>')
+
+    # ---- 顶部 KPI（多账号求和）
+    tot_today, tot_sum, n_today = 0.0, 0.0, 0
+    rng = None
+    for a in accts:
+        if a.get("usage_today") is not None:
+            tot_today += float(a["usage_today"])
+            n_today += 1
+        if a.get("usage_sum") is not None:
+            tot_sum += float(a["usage_sum"])
+        if not rng and a.get("usage_range"):
+            rng = a["usage_range"]
+    n_days = 0
+    for a in accts:
+        ds = a.get("usage_days")
+        if isinstance(ds, list):
+            n_days = max(n_days, len(ds))
+    avg = round(tot_sum / n_days, 2) if n_days else None
+
+    def _f(v):
+        if v is None:
+            return "—"
+        return ("%g" % round(float(v), 2))
+
+    kpi = [
+        ("今日消耗", _f(tot_today) if n_today else "—",
+         "今日暂无数据（延迟 2-3 小时）" if not n_today else "%d 个账号" % n_today),
+        ("窗口合计", _f(tot_sum), ("%s ~ %s" % (rng[0], rng[1])) if rng else "—"),
+        ("日均", _f(avg), "%d 天" % n_days if n_days else "—"),
+    ]
+    kpi_html = "".join(
+        '<div class="ucard"><div class="uv">%s</div><div class="uk">%s</div>'
+        '<div class="us">%s</div></div>' % (html.escape(v), html.escape(k), html.escape(s))
+        for k, v, s in kpi)
+
+    # ---- 走势（取第一个有数据的账号画）
+    spark_src = None
+    for a in accts:
+        if isinstance(a.get("usage_days"), list) and a["usage_days"]:
+            spark_src = a
+            break
+    spark = ""
+    if spark_src:
+        svg = _mini_bars(spark_src["usage_days"])
+        if svg:
+            spark = ('<div class="uspark"><div class="uslabel">%s 的每日消耗</div>%s</div>'
+                     % (html.escape(spark_src.get("name") or "—"), svg))
+
+    # ---- 明细表
+    rows = ['<div class="scroll"><table><thead><tr>'
+            '<th style="text-align:left">账号</th><th>今日</th>'
+            '<th>窗口合计</th><th>有数据天数</th><th style="text-align:left">走势</th>'
+            '</tr></thead><tbody>']
+    for a in accts:
+        ds = a.get("usage_days")
+        nd = len(ds) if isinstance(ds, list) else 0
+        cell_ok = bool(ds) or a.get("usage_today") is not None
+        cls = "" if cell_ok else "na"
+        svg = _mini_bars(ds, width=150, height=30) if isinstance(ds, list) else ""
+        td_today = ("<span class='st ok'>%s</span>" % html.escape(_f(a.get("usage_today")))
+                    if a.get("usage_today") is not None else "<span class='st na'>—</span>")
+        rows.append(
+            "<tr><td class='acc'>%s</td><td>%s</td><td class='%s'>%s</td>"
+            "<td class='%s'>%s</td><td style='text-align:left'>%s</td></tr>"
+            % (html.escape(a.get("name") or mask(a.get("uid"))),
+               td_today,
+               cls, html.escape(_f(a.get("usage_sum"))),
+               cls, html.escape(str(nd)),
+               svg or "<span class='mutd'>—</span>"))
+    rows.append("</tbody></table></div>")
+
+    err = ""
+    for a in accts:
+        if a.get("usage_err"):
+            err = ("<div class='uerr'>%s 读取失败：%s</div>"
+                   % (html.escape(a.get("name") or "—"), html.escape(str(a["usage_err"]))))
+            break
+
+    note = ('<div class="unote">口径：这里统计的是<strong>积分消耗</strong>'
+            '（模型调用按系数扣积分，非原始 token 数）。'
+            '官方提示「用量数据存在 2-3 小时延迟」，当天数字偏小或为空属正常。</div>')
+    return kpi_html + spark + "".join(rows) + err + note
 
 
 def render_report(h, days=30, tasks=None, daily=True):
@@ -629,8 +842,11 @@ def render_report(h, days=30, tasks=None, daily=True):
     det.append("</tbody></table></div>")
     detail_html = "".join(det)
 
-    # ---- 连登状态（阶段 A：只读采集，纯离线渲染）
-    streak_html = render_streak_block(last)
+    # ---- 连登状态（阶段 A 采集 + 阶段 B 兑换结果，纯离线渲染）
+    streak_html = render_streak_block(last, runs)
+
+    # ---- Token / 积分消耗（只读采集，纯离线渲染）
+    usage_html = render_usage_block(last)
 
     n_acct = len(acct_cols)
     n_run = len(runs)
@@ -659,6 +875,10 @@ def render_report(h, days=30, tasks=None, daily=True):
     %s
   </div>
   <div class="panel">
+    <h3>Token / 积分消耗<span class="sub" style="padding:0 0 0 6px">最近一次</span></h3>
+    %s
+  </div>
+  <div class="panel">
     <h3>历史签到矩阵</h3>
     <div class="sub">行 = 日期，列 = 账号；「已签」表示当天签到成功但积分变化 &lt; 0.01；「·」表示当天没有这个账号的记录。</div>
     %s
@@ -681,7 +901,7 @@ def render_report(h, days=30, tasks=None, daily=True):
        html.escape(last.get("ts") if last else "暂无运行记录"),
        "".join('<div class="card"><div class="v">%s</div><div class="k">%s</div></div>'
                % (html.escape(v), html.escape(k)) for k, v in cards),
-       acct_html, streak_html, matrix_html, chart_html, detail_html)
+       acct_html, streak_html, usage_html, matrix_html, chart_html, detail_html)
 
 
 def render_chart(daily):

@@ -11,6 +11,9 @@ docker/data/
 wb_daily_raw.log
 wb_daily_report.html
 
+# token 用量看板（本机生成的文件，含本机会话标题，不入仓）
+token-dashboard.html
+
 # 工作区记录（含内部账号信息，不入仓；但目录在磁盘上保留）
 .workbuddy/
 

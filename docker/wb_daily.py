@@ -75,6 +75,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 try:
     # 保留控制台自身编码（Windows 中文环境是 GBK），只把编不出来的字符替换掉，
@@ -260,6 +261,24 @@ def make_run(ts_iso, accounts, cat, note, success=True):
         gr = a.get("growth") or {}
         sk = gr.get("streak") or {}
         rs = gr.get("redeem") or {}
+        act = gr.get("redeem_action") or {}
+        # 兑换结果压成一句人话，报告直接渲染
+        act_results = act.get("results") or []
+        if act.get("skipped"):
+            redeem_text = "跳过：%s" % act["skipped"]
+        elif act_results:
+            redeem_text = "；".join(
+                "%s%s%s" % (x.get("name"), "已兑" if x.get("ok") else "失败",
+                            ("+%s" % x["credit"]) if x.get("credit") else "")
+                for x in act_results)
+        elif act.get("notes"):
+            redeem_text = "；".join(act["notes"])
+        else:
+            redeem_text = None
+        # 用量：只有接口真读通了才写值，否则一律 None（报告侧据此显示 "—"）
+        usg = a.get("usage") or {}
+        du = usg.get("daily") or {}
+        du_ok = bool(du.get("ok"))
         a_list.append({
             "name": a["name"],
             "uid": a["uid"],
@@ -272,7 +291,7 @@ def make_run(ts_iso, accounts, cat, note, success=True):
             "tc": a.get("tc"),
             "buy": a.get("buy"),
             "rw": a.get("rw"),
-            # —— 连登/成长（阶段 A：只读采集）——
+            # —— 连登/成长（阶段 A 采集 + 阶段 B 兑换）——
             # 连登天数优先用签到响应里的 streak_days（200 成功时才有），
             # 拿不到就退回 growth/streak 接口的值。两者取到的都是同一个数。
             "streak_days": (ck.get("streak") if ck.get("streak") is not None
@@ -281,7 +300,17 @@ def make_run(ts_iso, accounts, cat, note, success=True):
             "makeup_cards": sk.get("makeup_cards") if sk.get("ok") else None,
             "makeup_dates": sk.get("makeup_dates") if sk.get("ok") else None,
             "redeem_summary": (rs.get("counts") if rs.get("ok") else None),
+            "redeem_todo": act.get("todo") or None,
+            "redeem_text": redeem_text,
+            "redeem_ok": act.get("ok") if act else None,
             "growth_err": gr.get("err"),
+            "growth_redeem_err": act.get("err"),
+            # —— Token / 积分用量 ——
+            "usage_today": du.get("today") if du_ok else None,
+            "usage_days": du.get("days") if du_ok else None,
+            "usage_sum": du.get("sum") if du_ok else None,
+            "usage_range": du.get("range") if du_ok else None,
+            "usage_err": usg.get("err"),
         })
     summary = {
         "before": _r2(tot_before) if tot_before else None,
@@ -529,10 +558,25 @@ def cat_flow(token, uid, location_id, log, dry=False):
 #      奖励领取以当月最大连续登录且使用 WorkBuddy 的天数为准。」
 #   - 「补登卡为永久持有且上限 4 张，仅可补救当月断登的天数。」
 #
-# 阶段说明：当前（阶段 A）只做**只读**读取与展示，不发起任何写入。
+# 阶段说明：
+#   阶段 A（已上线）—— 只读采集，展示在报告里。
+#   阶段 B（本次）  —— 自动兑换已达档位。只在 WB_STREAK_REDEEM=1 且显式允许写入时执行；
+#                      仍受整条 try/except 隔离，绝不影响签到退出码。
+#   阶段 C（未做）  —— 用补登卡补断登。补「哪天」是策略问题，默认不动。
 STREAK_TIERS = [("starter", "入门档", "7d"),
                 ("advanced", "进阶档", "14d"),
                 ("legendary", "巅峰档", "28d")]
+
+# 档位门槛（天）。用于判断「已达哪几档」，比只看 next_tier 稳：
+# next_tier 只告诉你「下一个未兑的档」，而兑换要遍历所有已达档位。
+TIER_DAYS = {"7d": 7, "14d": 14, "28d": 28}
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_streak(token, uid):
@@ -617,13 +661,115 @@ def get_redeem_summary(token, uid):
     return r
 
 
-def growth_flow(token, uid, log, enabled=True):
-    """连登/成长只读采集。任何异常都吞掉，绝不影响签到结论（与派猫同样的隔离纪律）。
+def redeem_one(token, uid, tier, tier_name):
+    """兑换单个档位的连登奖励。一次调用，不重试。
 
-    阶段 A 只读：GET status + GET redeem/summary，不发起任何写操作。
+    client_token 用 uuid4 —— 服务端靠它做幂等；同一档位同月重复调用本就会被
+    「每档每月限兑 1 次」挡掉，uuid4 只是让重放更安全。
+    """
+    r = {"tier": tier, "name": tier_name, "ok": False, "http": 0,
+         "credit": None, "msg": "", "err": None, "raw_body": ""}
+    try:
+        body = {"tier": tier, "client_token": str(uuid.uuid4())}
+        st, text = call("POST", HOST_ACTIVITY + "/v2/activity/growth/redeem",
+                        token, uid, body)
+        r["http"] = st
+        r["raw_body"] = text
+        obj = jload(text)
+        if not isinstance(obj, dict):
+            r["err"] = "响应不是 JSON（http=%s）" % st
+            return r
+        r["msg"] = obj.get("msg") or obj.get("message") or ""
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        for key in ("credit", "credits", "amount", "reward"):
+            if data.get(key) is not None:
+                r["credit"] = _int_or_none(data.get(key))
+                break
+        # 成功判据：HTTP 200 且业务码 0 / None。
+        # 「本月已兑」类幂等命中算「无需兑换」，不算失败 —— 但要能从 msg 里看出来。
+        if st == 200 and obj.get("code") in (0, None):
+            r["ok"] = True
+        else:
+            r["err"] = "http=%s code=%s msg=%s" % (st, obj.get("code"), r["msg"])
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def plan_redeem(streak, summary):
+    """算出「应该兑哪几档」。纯函数，方便单测。
+
+    输入 streak（get_streak 的返回）与 summary（get_redeem_summary 的返回），
+    返回 (待兑列表, 说明文本列表)。规则：
+      - 已达档：streak.days >= 档位门槛
+      - 未兑：summary.counts[tier] 为 0 或缺失（缺失时保守认为「未知」，不兑）
+    可多档累计，所以遍历全部三档，不是只挑最高档。
+    """
+    todo, notes = [], []
+    days = streak.get("days")
+    if days is None:
+        return todo, ["连登天数未知（streak 接口没返回 days），本轮不兑换"]
+    if not summary.get("ok"):
+        return todo, ["本月已兑情况未知（redeem/summary 读不到），本轮不兑换"]
+    # ⚠️ 语义：summary.ok 为真表示「这个接口读通了」。
+    #    既然如此，缺 key 只能说明「该档本月已兑 0 次」，不能当成未知。
+    #    「未知」唯一的情形是接口整体没读通（上面已拦）。
+    counts = summary.get("counts") or {}
+    for key, name, tier in STREAK_TIERS:
+        need = TIER_DAYS.get(tier, 9999)
+        if days < need:
+            continue
+        done = counts.get(key)
+        if done is None:
+            done = 0        # 接口读通但没这个字段 → 保守按 0 次（= 可兑）
+        if done > 0:
+            notes.append("%s（%s）：本月已兑 %d 次，跳过" % (name, tier, done))
+            continue
+        todo.append({"tier": tier, "name": name, "key": key, "need": need,
+                     "done": done})
+    if not todo:
+        notes.append("没有可兑的档位（连登 %s 天）" % days)
+    return todo, notes
+
+
+def redeem_streak(token, uid, streak, summary, log, enabled=True):
+    """自动兑换连登奖励（阶段 B）。默认只在显式开启时执行；任何异常都被吞掉。"""
+    r = {"ok": True, "enabled": bool(enabled), "err": None,
+         "todo": [], "results": [], "notes": [], "skipped": None}
+    if not enabled:
+        r["enabled"] = False
+        r["skipped"] = "已按 WB_STREAK_REDEEM=0 跳过兑换"
+        return r
+    try:
+        todo, notes = plan_redeem(streak, summary)
+        r["todo"] = [t["tier"] for t in todo]
+        r["notes"] = list(notes)
+        for t in todo:
+            res = redeem_one(token, uid, t["tier"], t["name"])
+            log.append(("兑换连登 %s（%s）" % (t["name"], t["tier"]),
+                        res.get("http"), res.get("raw_body") or ""))
+            r["results"].append(res)
+            if not res.get("ok"):
+                # 不重试：失败就记下来，明天再说
+                r["notes"].append("%s 兑换失败：%s" % (t["name"], res.get("err")))
+        if any(not x.get("ok") for x in r["results"]):
+            r["ok"] = False
+            r["err"] = "；".join(x["err"] for x in r["results"] if not x.get("ok"))
+    except Exception as e:
+        r["ok"] = False
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def growth_flow(token, uid, log, enabled=True, redeem=False):
+    """连登/成长采集（+ 可选兑换）。
+
+    任何异常都吞掉，绝不影响签到结论（与派猫同样的隔离纪律）。
+    阶段 A：GET streak + GET redeem/summary（只读）
+    阶段 B：再加 POST redeem（仅当 redeem=True）
     """
     r = {"ok": True, "err": None, "enabled": bool(enabled),
-         "streak": None, "redeem": None}
+         "streak": None, "redeem": None, "redeem_action": None}
     if not enabled:
         r["err"] = "已按 WB_GROWTH=0 跳过"
         return r
@@ -634,9 +780,138 @@ def growth_flow(token, uid, log, enabled=True):
         rs = get_redeem_summary(token, uid)
         log.append(("读兑换汇总 growth/redeem/summary", rs.get("http"), rs.get("raw_body") or ""))
         r["redeem"] = rs
+
+        # ---- 阶段 B：只有在两个只读接口都读通的前提下才动手兑换 ----
+        # 读不通就不兑：宁可少兑一次，也不要盲写。
+        if redeem and sk.get("ok") and rs.get("ok"):
+            r["redeem_action"] = redeem_streak(token, uid, sk, rs, log, enabled=True)
+        elif redeem:
+            r["redeem_action"] = {
+                "ok": True, "enabled": True,
+                "err": None, "todo": [], "results": [], "notes": [],
+                "skipped": "连登状态或本月已兑情况读不通，本轮不兑换（宁可少兑，不盲写）",
+            }
+
         if not sk.get("ok") and not rs.get("ok"):
             r["ok"] = False
             r["err"] = "streak=%s / redeem=%s" % (sk.get("err"), rs.get("err"))
+    except Exception as e:
+        r["ok"] = False
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+# ---------------------------------------------------------------- Token / 积分用量
+# 接口来源：www.workbuddy.cn 主包 index-BTO2lsRd.js（786 KB）里内联的用量页代码，
+# 顺着「用量明细」文案挖出来的。请求体字段名是 **startTime/endTime**（驼峰），
+# 别和 get-user-resource 那套 SlicePeriodStartTime/PackageCodes 混了 —— 那是另一个接口。
+#
+#   POST /v2/billing/meter/get-user-daily-usage
+#        body {"startTime":"YYYY-MM-DD 00:00:00",
+#              "endTime":"YYYY-MM-DD 23:59:59",
+#              "pageNum":1,"pageSize":N}
+#        resp data.data.data[] = [{"date":"YYYY-MM-DD","credit":<消耗>}, ...]
+#             data.data.total  = 总条数
+#   POST /v2/billing/meter/get-user-request-usage   请求级明细，同上参数
+#
+# 业务要点（前端文案原文）：
+#   - 「CodeBuddy 插件、IDE、Code 采用积分计费模式，模型调用根据系数自动扣除积分。」
+#     → 这个 credit 就是**积分消耗**，积分按模型系数折算，不是原始 token 数。
+#   - 「用量数据存在 2-3 小时的数据延迟」→ 当天数据可能还没落库，别把「今天为 0」当异常。
+#   - 「用量明细仅展示 {date} 之后的数据」→ 有最早可查日期。
+#   - 前端的日期区间硬上限是 **31 天**，超了会被前端拦（服务端行为未验证，脚本也按 31 天封顶）。
+USAGE_MAX_DAYS = 31        # 前端 hard limit，照抄
+USAGE_DEFAULT_DAYS = 7     # 前端默认窗口
+
+
+def _usage_range(days):
+    """返回 (startTime, endTime) 字符串，按前端 li() 的格式。"""
+    days = max(1, min(int(days or USAGE_DEFAULT_DAYS), USAGE_MAX_DAYS))
+    today = datetime.date.today()
+    start = (today - datetime.timedelta(days=days - 1)).isoformat()
+    return start + " 00:00:00", today.isoformat() + " 23:59:59"
+
+
+def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS):
+    """读每日积分/用量。返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。"""
+    r = {"ok": False, "http": 0, "err": None, "days": [], "total": None,
+         "today": None, "sum": None, "raw_body": "", "range": None}
+    try:
+        st_t, en_t = _usage_range(days)
+        r["range"] = [st_t[:10], en_t[:10]]
+        body = {"startTime": st_t, "endTime": en_t, "pageNum": 1, "pageSize": 100}
+        st, text = call("POST", HOST_BILLING + "/v2/billing/meter/get-user-daily-usage",
+                        token, uid, body)
+        r["http"] = st
+        r["raw_body"] = text
+        obj = jload(text)
+        if not isinstance(obj, dict):
+            r["err"] = "响应不是 JSON（http=%s）" % st
+            return r
+        if st != 200 or obj.get("code") not in (0, None):
+            r["err"] = "http=%s code=%s msg=%s" % (
+                st, obj.get("code"), obj.get("msg") or obj.get("message"))
+            return r
+        # ⚠️ 双层 data：data.data.data 才是数组（前端写的是 E.data.data.data）。
+        #    但网关偶尔会少一层，所以逐层判空、能取到就用。
+        d = obj.get("data")
+        if isinstance(d, dict) and isinstance(d.get("data"), dict):
+            inner = d["data"]
+        else:
+            inner = d if isinstance(d, dict) else {}
+        arr = inner.get("data") if isinstance(inner, dict) else None
+        if not isinstance(arr, list):
+            r["err"] = "data.data.data 不是列表（可能字段改版）"
+            return r
+        r["total"] = _int_or_none(inner.get("total"))
+        out, tot = [], 0.0
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            dt = it.get("date") or it.get("Date")
+            # 没有日期的记录直接丢：这是「按天」的序列，缺日期就没法画、也没法比对
+            if dt in (None, ""):
+                continue
+            cr = it.get("credit")
+            if cr is None:
+                cr = it.get("Credit")
+            try:
+                cr = float(cr)
+            except (TypeError, ValueError):
+                cr = None
+            out.append({"date": str(dt)[:10],
+                        "credit": _r2(cr) if cr is not None else None})
+            if cr is not None:
+                tot += cr
+        # 按日期升序，方便报告画走势
+        out.sort(key=lambda x: x.get("date") or "")
+        r["days"] = out
+        r["sum"] = _r2(tot) if out else None
+        today_s = datetime.date.today().isoformat()
+        for it in out:
+            if (it.get("date") or "")[:10] == today_s:
+                r["today"] = it.get("credit")
+                break
+        r["ok"] = True
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def usage_flow(token, uid, log, enabled=True, days=USAGE_DEFAULT_DAYS):
+    """用量采集。隔离纪律同派猫/连登：任何异常都吞掉，绝不影响签到结论。"""
+    r = {"ok": True, "err": None, "enabled": bool(enabled), "daily": None}
+    if not enabled:
+        r["err"] = "已按 WB_USAGE=0 跳过"
+        return r
+    try:
+        du = get_daily_usage(token, uid, days=days)
+        log.append(("读每日用量 billing/meter/get-user-daily-usage",
+                    du.get("http"), du.get("raw_body") or ""))
+        r["daily"] = du
+        if not du.get("ok"):
+            r["ok"] = False
+            r["err"] = du.get("err")
     except Exception as e:
         r["ok"] = False
         r["err"] = "%s: %s" % (type(e).__name__, e)
@@ -844,8 +1119,9 @@ def do_account(acc, args, idx, total):
         if not cat.get("ok"):
             print("猫猫异常（不影响签到结论）: %s" % cat.get("err"))
 
-    # 连登/成长：放在最后，纯只读。即使整段出错也绝不影响签到与派猫的既有结论。
-    growth = growth_flow(token, uid, log, enabled=args.growth)
+    # 连登/成长：放在最后。读永远是只读；写入（兑换）只在 args.redeem 且两个只读
+    # 接口都读通时才发生。即使整段出错也绝不影响签到与派猫的既有结论。
+    growth = growth_flow(token, uid, log, enabled=args.growth, redeem=args.redeem)
     if args.growth:
         sk = growth.get("streak") or {}
         rs = growth.get("redeem") or {}
@@ -854,8 +1130,33 @@ def do_account(acc, args, idx, total):
                  sk.get("makeup_cards", {}).get("balance"),
                  sk.get("makeup_cards", {}).get("max")))
         print("      本月已兑: %s" % (rs.get("counts") or "—"))
+        act = growth.get("redeem_action")
+        if act:
+            if act.get("skipped"):
+                print("      兑换: 跳过（%s）" % act["skipped"])
+            elif act.get("results"):
+                for x in act["results"]:
+                    print("      兑换: %s %s%s"
+                          % (x.get("name"), "成功" if x.get("ok") else "失败",
+                             ("(+%s)" % x["credit"]) if x.get("credit") else ""))
+            else:
+                print("      兑换: 无需兑换（%s）" % ("；".join(act.get("notes") or []) or "已达档位都已兑"))
+            if not act.get("ok"):
+                print("      兑换异常（不影响签到结论）: %s" % act.get("err"))
         if not growth.get("ok"):
             print("连登读取异常（不影响签到结论）: %s" % growth.get("err"))
+
+    # 用量：放在最后。纯只读，异常隔离同上。
+    usage = usage_flow(token, uid, log, enabled=args.usage,
+                       days=getattr(args, "usage_days", USAGE_DEFAULT_DAYS))
+    if args.usage:
+        du = usage.get("daily") or {}
+        if du.get("ok"):
+            print("用量: 今日 %s，近 %s 天合计 %s"
+                  % (du.get("today") if du.get("today") is not None else "（暂无，数据有 2-3 小时延迟）",
+                     len(du.get("days") or []) , du.get("sum")))
+        else:
+            print("用量读取异常（不影响签到结论）: %s" % usage.get("err"))
 
     return {
         "name": acc["name"],
@@ -870,6 +1171,7 @@ def do_account(acc, args, idx, total):
         "rw": rw,
         "cat": cat,
         "growth": growth,
+        "usage": usage,
         "log": log,
     }
 
@@ -917,6 +1219,15 @@ def main():
     ap.add_argument("--no-growth", dest="growth", action="store_false",
                     default=_env_on("WB_GROWTH", True),
                     help="跳过连登/成长采集（等价于 WB_GROWTH=0）")
+    ap.add_argument("--no-redeem", dest="redeem", action="store_false",
+                    default=_env_on("WB_STREAK_REDEEM", True),
+                    help="不自动兑换连登奖励（等价于 WB_STREAK_REDEEM=0）")
+    ap.add_argument("--no-usage", dest="usage", action="store_false",
+                    default=_env_on("WB_USAGE", True),
+                    help="不采集 token/积分用量（等价于 WB_USAGE=0）")
+    ap.add_argument("--usage-days", type=int,
+                    default=int(os.environ.get("WB_USAGE_DAYS") or USAGE_DEFAULT_DAYS),
+                    help="用量窗口天数，默认 %d，上限 %d" % (USAGE_DEFAULT_DAYS, USAGE_MAX_DAYS))
     ap.add_argument("--location-id", type=int, default=LOCATION_DEFAULT)
     ap.add_argument("--report", default="report_single.html",
                     help="单次运行报告路径（默认在 DATA_DIR 下）")
@@ -962,7 +1273,7 @@ def main():
                 full_log.append("\n--- [%s][签到] %s  HTTP %s -----\n%s"
                                 % (r["name"], k, v["http"], v["body"]))
         for nm, st, body in r["log"]:
-            full_log.append("\n--- [%s][猫猫] %s  HTTP %s -----\n%s" % (r["name"], nm, st, body))
+            full_log.append("\n--- [%s] %s  HTTP %s -----\n%s" % (r["name"], nm, st, body))
 
     with open(data_path(args.raw_log), "w", encoding="utf-8") as f:
         f.write("\n".join(full_log))

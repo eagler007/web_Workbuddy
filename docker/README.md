@@ -4,9 +4,16 @@
 
 - **每日签到** —— 到点自动领积分
 - **派猫猫旅行** —— 先领奖励、再派新一趟（顺序有讲究，见下）
+- **连登奖励兑换** —— 自动兑换已达档位（入门 7 天 / 进阶 14 天 / 巅峰 28 天）
+- **Token / 积分消耗统计** —— 今日消耗、每日走势、每账号明细
 - **Web 控制台** —— 网页上加账号、测活、手动跑、看报告和日志
 
 不依赖 QD、不依赖青龙、不依赖任何外部数据库。纯 Python 标准库，一个容器搞定。
+
+> ⚠️ **连登这件事，脚本不能全自动。** 连登判定是「连续登录**且使用**」，
+> 「使用」= 你本人发一次对话。脚本负责签到、领积分、兑换奖励、统计消耗、并在
+> 报告里标出「今天是否已计入」——但**发起对话这个动作必须你自己做**。
+> 详见「九、成长中心『连续登录』怎么自动化的」。
 
 ---
 
@@ -92,7 +99,7 @@ Token 有效期约 60 天，过期后签到会返回 401 —— 到「账号」�
 |---|---|
 | 总览 | 看账号数 / 最近一次 / 归档量；点「全部账号跑一次」或「只跑这一个」 |
 | 账号 | 加账号（名称 + UID + Token）、测活、删除；Token 永远只显示掩码 |
-| 报告 | 账号概览 + 「日期 × 账号」签到矩阵 + 双轴走势 + 明细 |
+| 报告 | 账号概览 + 连登状态 + Token/积分消耗 + 「日期 × 账号」签到矩阵 + 双轴走势 + 明细 |
 | 日志 | 最近一次运行的完整输出（已二次脱敏） |
 
 **测活**：保存账号时会自动调一次查余额接口。提示 `有效 · 有效积分合计 N` 就说明 token 没问题；`401 未授权` 就是 token 过期或写错了。
@@ -158,15 +165,21 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 | 兑换汇总 | `GET  https://www.workbuddy.cn/v2/activity/growth/redeem/summary` |
 | 兑换连登奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/redeem`，body `{"tier":"…","client_token":"…"}` |
 | 用补登卡 | `POST https://www.workbuddy.cn/v2/activity/growth/makeup-cards/use`，body `{"target_date":"YYYY-MM-DD"}` |
+| **每日用量** | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-daily-usage`，body `{"startTime":"YYYY-MM-DD 00:00:00","endTime":"YYYY-MM-DD 23:59:59","pageNum":1,"pageSize":100}` |
+| 请求级明细 | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-request-usage`，参数同上 |
 | 猫猫状态 | `GET  https://www.workbuddy.cn/v2/activity/growth/buddy/travel/status` |
 | 领奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/claim` |
 | 派出去 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/depart` |
 
 认证头：`Authorization: Bearer <token>` + `X-User-Id: <uid>`。
 
-> 这些接口名不是猜的，是从产品自己的前端包 `growthSpace-CCYzF8bt.js`（仅 3.3 KB）
-> 里逐字抄下来的 —— 那是个把整组 API 常量写死的小 chunk。
-> 以后再要找新接口，照这个套路：入口页 → 主包列 chunk → 找几 KB 的常量包。
+> 这些接口名不是猜的，是从产品自己的前端包里挖出来的：
+> - 连登/派猫 → `growthSpace-CCYzF8bt.js`（仅 3.3 KB，整组 API 常量写死）
+> - 每日用量 → `index-BTO2lsRd.js`（786 KB 主包，用量页是**内联**的，顺着「用量明细」
+>   文案挖到 `get-user-daily-usage`）
+>
+> 以后再要找新接口，照这个套路：入口页 → 主包列 chunk → 找几 KB 的常量包；
+> 找不到就回主包里搜**中文 UI 文案**，顺着文案找它旁边的请求调用。
 
 ---
 
@@ -176,18 +189,63 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 
 | 动作 | 是否自动 | 说明 |
 |---|---|---|
-| 每天「登录」 | ✅ 已被签到覆盖 | 连登定义为「连续登录**且使用** WorkBuddy 的天数」。每天的签到请求带真实 Bearer token，等价于登录并使用 —— **不需要开桌面端**。 |
-| 连登奖励兑换 | ✅ 默认自动 | 入门档 7 天 / 进阶档 14 天 / 巅峰档 28 天，**可多档累计，每档每月限兑 1 次**。脚本先读 `redeem/summary` 确认本月没兑过，再对每个已达档位兑一次。 |
+| 每天「登录」 | ⚠️ 需要你发一次对话 | 连登定义为「连续登录**且使用** WorkBuddy 的天数」。脚本能自动签到领积分，但**「使用」这个动作只有本人能做**——脚本不会替你伪造对话。 |
+| 连登奖励兑换 | ✅ 默认自动 | 入门档 7 天 / 进阶档 14 天 / 巅峰档 28 天，**可多档累计，每档每月限兑 1 次**。脚本先读 `redeem/summary` 确认本月没兑过，再对每个已达档位兑一次（`client_token` 用 uuid4 保证幂等）。 |
 | 断登补签 | ⛔ 默认关闭 | 补登卡上限 4 张、永久持有、**不可逆**。默认只在报告里显示余额，不写入。要开就设 `WB_STREAK_MAKEUP=1`。 |
 | 任务系统 | ⛔ 未实现 | 「完成任务」多半依赖真实使用行为（如对话 N 次），脚本无法伪造；接受一个做不完的任务无收益。 |
 
-开关都在 `.env`：`WB_GROWTH`（总闸）/ `WB_STREAK_REDEEM` / `WB_STREAK_MAKEUP`。
+### 兑换逻辑（阶段 B）
 
-报告页有「连登状态」区块，显示每个账号的：当前连登天数 / 下一档位 / 补登卡余额 / 本月各档已兑次数。
+```
+① GET  streak          -> 拿 days / next_tier（判断已达哪些档）
+② GET  redeem/summary  -> 拿本月每档已兑次数
+③ 对每一档（7d/14d/28d）：已达档 && 本月该档未兑 -> POST redeem {tier, client_token}
+④ 不重试：一个档位一次调用，失败就记进报告，下轮/明天再说
+```
+
+两条硬纪律：
+
+- **遍历所有已达档位**，不是只兑最高档（多档累计是规则允许的）。
+- **读不通就不兑**：`streak` 或 `redeem/summary` 任一读不到，本轮直接跳过兑换 ——
+  宁可少兑一次，也不要盲写。
+
+报告页有「连登状态」区块，除天数/档位/补登卡/本月已兑外，还多两列：
+
+- **今日是否计入** —— 跟历史对比连登天数，没涨就是「尚未计入」（这个信号告诉你今天该发对话了）
+- **本次兑换** —— 这一轮自动兑换的结果（已兑 / 失败 / 跳过 及其原因）
+
+开关都在 `.env`：`WB_GROWTH`（总闸）/ `WB_STREAK_REDEEM` / `WB_STREAK_MAKEUP`。
 
 ---
 
-## 十、目录结构
+## 十、Token / 积分消耗统计
+
+报告页有「Token / 积分消耗」区块：今日消耗、窗口合计、日均、每日走势柱状图，
+外加每账号明细（今日 / 合计 / 有数据天数 / 迷你走势）。
+
+**口径要说清楚**：CodeBuddy 采用**积分计费**，模型调用按系数扣积分 ——
+所以这里统计的是**积分消耗**，不是原始 token 数。接口字段就叫 `credit`。
+
+数据来自 `POST /v2/billing/meter/get-user-daily-usage`，
+由 `wb_daily.py` 的 `usage_flow()` 采集，写进归档的 `usage_today` / `usage_days` /
+`usage_sum` / `usage_range` 字段，报告侧纯离线渲染（不联网）。
+
+相关的两个坑：
+
+1. **「用量数据存在 2-3 小时的数据延迟」**（官方文案原文）。当天数字偏小或为空属正常，
+   脚本不会把「今天为 0」当错误 —— 只有接口整体读不通才算失败。
+2. **日期区间最大 31 天**，这是前端硬限制，脚本也按 31 天封顶。
+
+开关：`WB_USAGE=1`（总闸）、`WB_USAGE_DAYS=7`（窗口天数，1~31）。
+
+> 想看**本机**（而不是账号级）的详细用量，另有 `token-dashboard` 技能：
+> 它读本机 `~/.workbuddy/projects/**/*.jsonl` 的请求级真实 usage，
+> 出的是另一张看板（含模型分布、工作空间下钻、金额估算）。
+> 两者互补：本页看**账号级积分**，看板看**本机请求级明细**。
+
+---
+
+## 十一、目录结构
 
 ```
 docker/
