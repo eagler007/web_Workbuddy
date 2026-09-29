@@ -813,6 +813,31 @@ def _ghcr_update_info(local, timeout=10):
         return None
 
 
+def _to_cn_time(raw):
+    """UTC ISO 时间 → 北京时间字符串。解析失败原样返回，绝不抛异常。
+
+    来源两种格式：GitHub API `2026-09-29T02:58:29Z`、
+    GHCR 镜像构建时间 `2026-09-29T02:58:29.283413737Z`（纳秒精度，
+    fromisoformat 只吃 6 位小数，需先截断）。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        txt = s[:-1] + "+00:00" if s.endswith("Z") else s
+        m = re.match(r"^(.+?\d)\.(\d+)([+-]\d{2}:?\d{2}|Z)?$", txt)
+        if m:
+            txt = "%s.%s%s" % (m.group(1), m.group(2)[:6].ljust(6, "0"),
+                               m.group(3) or "")
+        dt = datetime.datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        cn = dt.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+        return cn.strftime("%Y-%m-%d %H:%M:%S") + "（北京时间）"
+    except Exception:
+        return s
+
+
 def check_update():
     """查远端最新 commit，和本地比对。
 
@@ -889,7 +914,7 @@ def view_update(msg="", nonce="", info=None):
                              }.get(info.get("via"))),
            _row("本地 commit", _s((info.get("local") or "")[:12])),
            _row("远端 commit", _s((info.get("remote") or "")[:12])),
-           _row("远端提交时间", _s(info.get("remote_date"))),
+           _row("远端提交时间", _s(_to_cn_time(info.get("remote_date")))),
            _row("远端最新提交", _s(info.get("remote_msg")))]
     if info.get("remote_url"):
         ver.append('<div class="kv"><span>查看提交</span><b><a href="%s" target="_blank" '
