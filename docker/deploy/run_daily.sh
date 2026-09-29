@@ -19,9 +19,15 @@ fi
 echo "[run_daily] 开始 $(date '+%F %T %Z')"
 "$PY" "$HERE/wb_daily.py" \
     --report "$DATA_DIR/report_single.html" \
-    --raw-log "$DATA_DIR/wb_daily_raw.log"
+    --raw-log "$DATA_DIR/last_run.log"
 RC=$?
 echo "[run_daily] wb_daily 退出码 $RC"
+
+# 把当次完整输出按天归档（历史保留、不覆盖；不含凭据）
+"$PY" "$HERE/runlog.py" --ingest "$DATA_DIR/last_run.log" || \
+    echo "[run_daily][warn] 日志归档失败（不影响签到结果）"
+# 顺手清理 180 天前的历史日志
+"$PY" "$HERE/runlog.py" --prune >/dev/null 2>&1 || true
 
 # 归档已经由 wb_daily.py 写好，这里只把它渲染成聚合报告（离线，不连任何外部服务）
 "$PY" "$HERE/wb_report.py" --report "$DATA_DIR/report.html" || \

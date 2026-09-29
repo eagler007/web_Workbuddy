@@ -45,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,6 +58,7 @@ except Exception:
 
 # ---------------------------------------------------------------- 常量
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)              # 让 `import runlog` / `import usage` 不受 cwd 影响
 DATA_DIR = os.environ.get("DATA_DIR") or "/data"
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
@@ -630,24 +632,43 @@ def view_report(msg=""):
     return page("报告", body, on="/report", msg=msg, nonce="")
 
 
-def view_logs(msg="", nonce=""):
-    txt = ""
-    if os.path.isfile(RUN_LOG):
+def view_logs(msg="", nonce="", date=None):
+    """运行日志页：历史按天保留，默认显示当日，可 ?date=YYYY-MM-DD 查任意一天。"""
+    try:
+        import runlog as RL
+    except Exception:
+        RL = None
+    today = datetime.date.today().isoformat()
+    date = date or today
+    dates = RL.list_dates() if RL else []
+    # 读出当日（或指定日）的归档文本
+    raw = RL.read_date(date) if RL else ""
+    if not raw and date == today and os.path.isfile(RUN_LOG):
+        # 兼容迁移前最后一次的 last_run.log 单文件
         try:
             with open(RUN_LOG, "r", encoding="utf-8", errors="replace") as f:
-                txt = f.read()
-        except Exception as e:
-            txt = "[读不到] %s" % e
-    if not txt:
-        txt = "（还没有运行日志）"
-    # 二次防线：万一有 token 形态的串，替换掉
-    txt = re.sub(r"eyJ[A-Za-z0-9._\-]{20,}", "***REDACTED***", txt)
-    # 第三道防线：推送 key（Server 酱 SCT… / ³ 形如 xxxxxtxxxxxx）也不能漏出去
+                raw = f.read()
+        except Exception:
+            raw = ""
+    if not raw:
+        raw = "（这一天还没有运行日志）"
+    # 凭据打码（二次防线）
+    txt = re.sub(r"eyJ[A-Za-z0-9._\-]{20,}", "***REDACTED***", raw)
     txt = re.sub(r"\bSCT[A-Za-z0-9]{6,}", "***REDACTED***", txt)
-    body = """<div class="panel"><h3>最近一次运行的输出</h3>
-<div class="sub">这里只保留最后一次（%s）。历史日志随运行覆盖。</div>
+    # 日期选择器
+    chips = ""
+    if dates:
+        for d in dates:
+            on = " on" if d == date else ""
+            chips += ('<a class="chip%s" href="/logs?date=%s">%s</a>'
+                      % (on, html.escape(d), html.escape(d)))
+    sel = ('<div class="chips" style="margin:0 16px 12px">%s</div>' % chips) if chips else ""
+    body = """<div class="panel"><h3>运行日志</h3>
+<div class="sub">历史日志按天保留 180 天，默认显示当日；点上面的日期查任意一天。</div>
+%s
+<div class="sub" style="margin:10px 16px 4px">当前：<b>%s</b>（共 %d 天有记录）</div>
 <pre style="margin:0 16px 16px">%s</pre></div>""" % (
-        html.escape(RUN_LOG), html.escape(txt))
+        sel, html.escape(date), len(dates), html.escape(txt))
     return page("日志", body, on="/logs", msg=msg, nonce=nonce)
 
 
@@ -887,6 +908,43 @@ def _line_svg(dates, per_day, w=560, h=150):
             '%s</svg>' % (w, h, h, area, line, marks))
 
 
+def _bars_h(pairs, maxn=12):
+    """横向条形图：pairs = [(label, value), ...]（按值降序传入）。色走主题变量。"""
+    if not pairs:
+        return ""
+    vals = [float(v or 0) for _, v in pairs]
+    mx = max(vals) or 1.0
+    parts = []
+    for lab, v in pairs[:maxn]:
+        v = float(v or 0)
+        w = max((v / mx) * 100.0, 0.6)     # 百分比宽度（最小可见）
+        parts.append(
+            '<div class="hbar"><span class="hl">%s</span>'
+            '<span class="htrack"><span class="hfill" style="width:%.1f%%">'
+            '<title>%s：%.2f</title></span></span>'
+            '<span class="hv">%.2f</span></div>'
+            % (html.escape(str(lab)), w, html.escape(str(lab)), v, v))
+    return '<div class="hbars">%s</div>' % "".join(parts)
+
+
+def _heat_grid(dates, per_day):
+    """日历热力矩阵：dates 升序，per_day 是同日期的积分。色阶走主题变量（只变透明度）。"""
+    if not dates:
+        return ""
+    vals = [float(per_day.get(d) or 0) for d in dates]
+    mx = max(vals) or 1.0
+    cells = []
+    for d in dates:
+        v = float(per_day.get(d) or 0)
+        op = 0.12 + 0.88 * (v / mx) if mx else 0.12
+        cells.append(
+            '<div class="heatcell" title="%s：%.2f">'
+            '<div class="hblock" style="opacity:%.2f"></div>'
+            '<div class="hdate">%s</div><div class="hval">%.2f</div></div>'
+            % (html.escape(d), v, op, html.escape(d[5:]), v))
+    return '<div class="heat">%s</div>' % "".join(cells)
+
+
 def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached=False):
     """用量看板：自动请求真实接口，展示每个账号的积分消耗。"""
     try:
@@ -919,13 +977,17 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
                 '<div class="s">%s</div></div>'
                 % (html.escape(k), v, html.escape(s)))
 
+    req_total = 0
+    for r in ok_rows:
+        if r.get("total") is not None:
+            req_total += int(r["total"])
     kpis = [
         _kpi("今日消耗", ("%.2f" % today_sum) if have_today else "—", "积分"),
         _kpi("%d 天合计" % days, ("%.2f" % total_sum) if total_sum is not None else "—",
              "积分"),
         _kpi("日均", ("%.2f" % (total_sum / days)) if total_sum else "0.00", "积分/天"),
+        _kpi("请求数", "%d" % req_total if req_total else "—", "窗口内调用次数"),
         _kpi("账号数", "%d / %d" % (n_ok, n_all), "可用 / 总数"),
-        _kpi("查询窗口", "%d 天" % days, "上限 31"),
     ]
     body = '<div class="kpis">%s</div>' % "".join(kpis)
 
@@ -964,10 +1026,34 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
         body += ('<div class="panel"><h3>每日总消耗走势</h3>'
                  '<div style="padding:4px 16px 16px">%s</div></div>'
                  % _line_svg(dates, per_day))
+        # 日历热力矩阵（参考 token-dashboard 版式）
+        body += ('<div class="panel"><h3>每日消耗热力</h3>'
+                 '<div class="sub">色越深 = 当天消耗越高；当天为空 / 0 可能是 2–3h 数据延迟。</div>'
+                 '<div style="padding:8px 16px 16px">%s</div></div>'
+                 % _heat_grid(dates, per_day))
     else:
         body += ('<div class="panel"><h3>每日总消耗走势</h3>'
                  '<p class="trim">接口没返回带日期的记录。'
                  '用量数据有 2–3 小时延迟，当天为空属正常。</p></div>')
+
+    # ---- 按模型 / 按时段（跨账号汇总）
+    _agg_model, _agg_hour, _all_reqs = {}, {}, []
+    for r in ok_rows:
+        for m, v in (r.get("by_model") or {}).items():
+            _agg_model[m] = _agg_model.get(m, 0.0) + float(v or 0)
+        for h, v in (r.get("by_hour") or {}).items():
+            _agg_hour[int(h)] = _agg_hour.get(int(h), 0.0) + float(v or 0)
+        for rq in (r.get("requests") or []):
+            _all_reqs.append(rq)
+    if _agg_model:
+        _mp = sorted(_agg_model.items(), key=lambda x: -x[1])
+        body += ('<div class="panel"><h3>按模型消耗</h3>'
+                 '<div style="padding:8px 16px 16px">%s</div></div>' % _bars_h(_mp))
+    if _agg_hour:
+        _hp = [("%02d" % h, _agg_hour.get(h, 0.0)) for h in range(24)]
+        body += ('<div class="panel"><h3>0–24 时分布</h3>'
+                 '<div class="sub">按请求发生小时聚合的积分消耗。</div>'
+                 '<div style="padding:8px 16px 16px">%s</div></div>' % _bars_h(_hp))
 
     # ---- 账号明细
     trs = ""
@@ -1018,6 +1104,28 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
                     _bars_svg(pairs)))
     if mini:
         body += '<div class="panel"><h3>各账号每日消耗</h3>%s</div>' % mini
+
+    # ---- 请求级明细（跨账号，按时间倒序）
+    if _all_reqs:
+        _all_reqs.sort(key=lambda x: (x.get("ts") or ""), reverse=True)
+        _rtrs = ""
+        for rq in _all_reqs[:100]:
+            cr = rq.get("credit")
+            _rtrs += ('<tr><td class="mono" style="font-size:12px">%s</td>'
+                      '<td>%s</td><td>%s</td>'
+                      '<td class="credit">%s</td></tr>'
+                      % (html.escape(str(rq.get("ts") or "")),
+                         html.escape(str(rq.get("model") or "-")),
+                         html.escape(str(rq.get("client") or "-")),
+                         ("%.2f" % float(cr)) if cr is not None else "—"))
+        body += ('<div class="panel"><h3>请求级明细（最近 %d 条）</h3>'
+                 '<div class="scroll"><table>'
+                 '<tr><th>时间</th><th>模型</th><th>客户端</th><th>积分</th></tr>'
+                 '%s</table></div>'
+                 '<p class="hint" style="padding:0 16px 14px">明细来自 '
+                 '<code>get-user-request-usage</code> 请求级接口，'
+                 '只含模型 / 客户端 / 积分，不含任何凭据。</p></div>'
+                 % (len(_all_reqs[:100]), _rtrs))
 
     # ---- 定时采集历史（每天早上跑的那一轮）
     hist = load_usage_history()
@@ -1079,9 +1187,10 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
     body += """<div class="panel"><h3>口径说明</h3><div class="sub" style="padding:0 16px 16px">
 <strong>这里查的是「积分消耗」，不是原始 token 数。</strong>CodeBuddy 采用积分计费，
 模型调用按系数自动扣除积分。<br>
-接口：<code>POST /billing/meter/get-user-daily-usage</code>（注意**不带 /v2**，
-查余额那条才带 —— 写错前缀会 404）；
-数据存在 <strong>2–3 小时延迟</strong>，当天为 0 或为空是正常的，不代表没消耗。<br>
+接口：<code>POST /billing/meter/get-user-request-usage</code>（注意**不带 /v2**，
+查余额 / 签到那条才带 —— 写错前缀会 404）；
+<code>get-user-daily-usage</code> 是幻觉接口（任何参数都 <code>invalid params</code>，
+已于 2026-09-29 弃用）。数据存在 <strong>2–3 小时延迟</strong>，当天为 0 或为空是正常的。<br>
 窗口上限 31 天（前端硬限制）。可在「设置」区调默认窗口
 <code>WB_USAGE_DAYS</code>。
 </div></div>"""
@@ -1217,7 +1326,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts":
             return self._send(200, view_accounts(nonce=nonce))
         if path == "/logs":
-            return self._send(200, view_logs(nonce=nonce))
+            _ld = (qs.get("date") or [""])[0] or None
+            return self._send(200, view_logs(nonce=nonce, date=_ld))
         if path == "/update":
             return self._send(200, view_update(nonce=nonce))
         if path == "/usage":

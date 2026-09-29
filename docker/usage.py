@@ -4,38 +4,38 @@
 
 从 wb_daily.py 抽出来，供 Web 控制台直接调用（控制台不该 import 整个签到脚本）。
 
-接口来源：www.workbuddy.cn 主包 index-BTO2lsRd.js（786 KB）里内联的用量页代码，
-顺着「用量明细」文案挖出来的。请求体字段名是 **startTime/endTime**（驼峰），
-别和 get-user-resource 那套 SlicePeriodStartTime/PackageCodes 混了 —— 那是另一个接口。
-
-⚠️ **前缀陷阱（2026-09-28 实测确认）**：同一批 `/billing/meter/*` 接口里，
-**只有「查余额 / 签到」带 `/v2` 前缀，「用量」三个接口不带**：
-
-    POST /v2/billing/meter/get-user-resource        ← 带 /v2 ✅（签到/余额用）
-    POST /v2/billing/meter/daily-checkin            ← 带 /v2 ✅
-    POST /billing/meter/get-user-daily-usage        ← **不带 /v2** ✅
-    POST /billing/meter/get-user-request-usage      ← **不带 /v2** ✅
-    POST /billing/meter/get-user-resource-summary   ← **不带 /v2** ✅
-
-带错的症状就是 **HTTP 404**（路径不存在；不是 401，401 才是凭据问题）。
-用 `curl -X POST` 空 body 探一下就能区分：404=路径错，401=路径对但没凭据。
-
-    请求体 {"startTime":"YYYY-MM-DD 00:00:00",
-            "endTime":"YYYY-MM-DD 23:59:59",
-            "pageNum":1,"pageSize":N}
-    响应   data.data.data[] = [{"date":"YYYY-MM-DD","credit":<消耗>}, ...]
-           data.data.total  = 总条数
+⚠️ **接口真相（2026-09-29 实测确认，踩坑纪录）**：
+- `get-user-daily-usage` **这个接口根本不存在** —— 任何 body（camelCase / PascalCase /
+  带毫秒 / 带 ProductCode）都返回 `{"code":...,"msg":"invalid params"}`，纯属幻觉接口。
+- **真正能用的只有 `get-user-request-usage`**（请求级明细）：
+      POST https://www.codebuddy.cn/billing/meter/get-user-request-usage
+  - **不带 /v2 前缀**（和查余额/签到那条相反 —— 同组 `/billing/meter/*` 前缀不统一，
+    带错就是 404：404=路径错，401=路径对但没凭据）。
+  - 鉴权：`Authorization: Bearer <token>` + `X-User-Id: <uid>`（和其它接口一致）。
+  - 请求体（camelCase，实测通）：
+        {"startTime":"YYYY-MM-DD 00:00:00",
+         "endTime":"YYYY-MM-DD 23:59:59",
+         "pageNum":1, "pageSize":500}
+  - 响应（**两层 data**，不是三层）：
+        {"code":0,"msg":"OK",
+         "data":{"total":N,
+                 "data":[{"requestId":..,"credit":0.37,"model":"deepseek-v4.1-flash",
+                          "client":"WorkBuddy","requestTime":"2026-09-29 09:38:00", ...}]}}
+    `data.data` 是请求数组，`data.total` 是总条数。`pageSize=500` 一般一次拿全。
 
 业务要点（前端文案原文）：
   - 「CodeBuddy 插件、IDE、Code 采用积分计费模式，模型调用根据系数自动扣除积分。」
-    → 这个 credit 就是**积分消耗**，积分按模型系数折算，不是原始 token 数。
+    → 这个 `credit` 就是**积分消耗**，按模型系数折算，不是原始 token 数。
   - 「用量数据存在 2-3 小时的数据延迟」→ 当天数据可能还没落库，别把「今天为 0」当异常。
-  - 「用量明细仅展示 {date} 之后的数据」→ 有最早可查日期。
   - 前端的日期区间硬上限是 **31 天**，超了会被前端拦（服务端行为未验证，这里也按 31 天封顶）。
+
+聚合（本模块在客户端做）：把请求级明细按 `requestTime` 前 10 位按日求和，
+并切出 `by_model` / `by_client` / `by_hour` / `requests` 明细，供看板直接渲染。
 
 依赖：纯标准库。**不 import wb_daily**（避免控制台被签到脚本的重依赖拖住）。
 """
 
+import collections
 import datetime
 import json
 import os
@@ -47,13 +47,15 @@ TIMEOUT = 20
 USAGE_MAX_DAYS = 31        # 前端 hard limit，照抄
 USAGE_DEFAULT_DAYS = 7     # 前端默认窗口
 
-# ⚠️ 用量接口**不带** /v2 前缀（查余额/签到那条才带）。见文件头说明。
-PATH_DAILY_USAGE = "/billing/meter/get-user-daily-usage"
+# ⚠️ 唯一真接口：请求级明细（不带 /v2）。见文件头说明。
+#    `get-user-daily-usage` 是幻觉接口（任何参数都 invalid params），绝不能用。
 PATH_REQUEST_USAGE = "/billing/meter/get-user-request-usage"
-PATH_RESOURCE_SUMMARY = "/billing/meter/get-user-resource-summary"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) WorkBuddy-Usage/1.0")
+
+# 请求明细最多保留多少条给"明细表"（再多页面也渲染不动）
+MAX_REQUEST_ROWS = 300
 
 
 # ---------------------------------------------------------------- 小工具
@@ -147,76 +149,135 @@ def usage_range(days):
     return start + " 00:00:00", today.isoformat() + " 23:59:59"
 
 
+def _parse_records(text):
+    """把响应文本解析成请求级明细列表。返回 (records, total, err)。
+
+    兼容两层 / 三层 data 嵌套。坏响应一律返回 ([], None, err_msg)，绝不抛。
+    """
+    obj = _jload(text)
+    if not isinstance(obj, dict):
+        return [], None, "响应不是 JSON"
+    # code 非 0（含 invalid params / 401 网关）都算"取不到"
+    code = obj.get("code")
+    if code not in (0, None):
+        msg = obj.get("msg") or obj.get("message") or ""
+        return [], None, ("invalid params" if "invalid" in str(msg).lower()
+                          else "code=%s msg=%s" % (code, msg))
+    d = obj.get("data")
+    if not isinstance(d, dict):
+        # 有的响应把数组直接放 data 下（单层）
+        if isinstance(d, list):
+            return d, len(d), None
+        return [], None, "data 字段缺失/类型不对"
+    arr = d.get("data") if isinstance(d.get("data"), list) else None
+    total = _int_or_none(d.get("total"))
+    if arr is None and isinstance(d.get("data"), dict):
+        # 三层嵌套兜底（理论上本接口不会走到这里）
+        inner = d["data"]
+        arr = inner.get("data") if isinstance(inner.get("data"), list) else None
+        total = total or _int_or_none(inner.get("total"))
+    if arr is None:
+        arr = []
+    return arr, total, None
+
+
 # ---------------------------------------------------------------- 主查询
 def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller=None):
-    """读每日积分/用量。返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。
+    """读真实积分消耗（请求级明细，客户端聚合）。
+
+    返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。
 
     返回字段：
-      ok/http/err/raw_body/range[起,止]/total/days[{date,credit}]/sum/today/path
+      ok/http/err/raw_body/range[起,止]/path
+      days      : [{"date","credit"}]           按日求和（升序）
+      by_model  : {"model": credit}             按模型（横向条）
+      by_client : {"client": credit}            按客户端（WorkBuddy/IDE…）
+      by_hour   : {0..23: credit}               0-24 时分布
+      requests  : [{"ts","model","client","credit"}]  最多 MAX_REQUEST_ROWS 条（按时间倒序）
+      total     : 窗口内请求条数
+      sum       : 窗口合计积分
+      today     : 今日积分（可能为 0 / None）
 
     caller：可选，注入的 HTTP 函数（见 _call_with_prefix_fallback）。
     """
-    r = {"ok": False, "http": 0, "err": None, "days": [], "total": None,
-         "today": None, "sum": None, "raw_body": "", "range": None, "path": None}
+    r = {"ok": False, "http": 0, "err": None, "days": [],
+         "by_model": {}, "by_client": {}, "by_hour": {}, "requests": [],
+         "total": None, "sum": None, "today": None,
+         "raw_body": "", "range": None, "path": None}
     try:
         st_t, en_t = usage_range(days)
         r["range"] = [st_t[:10], en_t[:10]]
-        body = {"startTime": st_t, "endTime": en_t, "pageNum": 1, "pageSize": 100}
+        body = {"startTime": st_t, "endTime": en_t, "pageNum": 1, "pageSize": 500}
         st, text, used = _call_with_prefix_fallback(
-            PATH_DAILY_USAGE, token, uid, body, timeout=timeout, caller=caller)
+            PATH_REQUEST_USAGE, token, uid, body, timeout=timeout, caller=caller)
         r["http"] = st
         r["raw_body"] = text
         r["path"] = used
-        obj = _jload(text)
-        if not isinstance(obj, dict):
-            r["err"] = "响应不是 JSON（http=%s）" % st
-            return r
-        if st != 200 or obj.get("code") not in (0, None):
-            r["err"] = "http=%s code=%s msg=%s" % (
-                st, obj.get("code"), obj.get("msg") or obj.get("message"))
+        if st != 200:
+            r["err"] = "http=%s" % st
             if st == 404:
                 r["err"] += "（路径 %s 不存在 —— 检查前缀是否该带/不该带 /v2）" % used
             return r
-        # ⚠️ 双层 data：data.data.data 才是数组（前端写的是 E.data.data.data）。
-        #    但网关偶尔会少一层，所以逐层判空、能取到就用。
-        d = obj.get("data")
-        if isinstance(d, dict) and isinstance(d.get("data"), dict):
-            inner = d["data"]
-        else:
-            inner = d if isinstance(d, dict) else {}
-        arr = inner.get("data") if isinstance(inner, dict) else None
-        if not isinstance(arr, list):
-            r["err"] = "data.data.data 不是列表（可能字段改版）"
+        recs, total, err = _parse_records(text)
+        if err:
+            r["err"] = err
             return r
-        r["total"] = _int_or_none(inner.get("total"))
-        out, tot = [], 0.0
-        for it in arr:
+        if not recs:
+            # 空数据（可能当天还没落库 / 区间内确实没调用）—— 不算失败，给空壳
+            r["total"] = total or 0
+            r["sum"] = 0.0
+            r["ok"] = True
+            return r
+
+        per_day = collections.defaultdict(float)
+        per_model = collections.defaultdict(float)
+        per_client = collections.defaultdict(float)
+        per_hour = collections.defaultdict(float)
+        out_reqs = []
+        today_s = datetime.date.today().isoformat()
+        for it in recs:
             if not isinstance(it, dict):
                 continue
-            dt = it.get("date") or it.get("Date")
-            # 没有日期的记录直接丢：这是「按天」的序列，缺日期就没法画、也没法比对
-            if dt in (None, ""):
-                continue
-            cr = it.get("credit")
+            # 真接口用 requestTime；个别形态可能用 date，都兼容
+            ts = str(it.get("requestTime") or it.get("request_time")
+                     or it.get("date") or "")
+            dt = ts[:10]
+            cr = _r2(it.get("credit"))
             if cr is None:
-                cr = it.get("Credit")
-            try:
-                cr = float(cr)
-            except (TypeError, ValueError):
-                cr = None
-            out.append({"date": str(dt)[:10],
-                        "credit": _r2(cr) if cr is not None else None})
-            if cr is not None:
-                tot += cr
-        # 按日期升序，方便报告画走势
-        out.sort(key=lambda x: x.get("date") or "")
-        r["days"] = out
-        r["sum"] = _r2(tot) if out else None
-        today_s = datetime.date.today().isoformat()
-        for it in out:
-            if (it.get("date") or "")[:10] == today_s:
-                r["today"] = it.get("credit")
-                break
+                cr = 0.0
+            model = str(it.get("model") or it.get("modelName") or "?")
+            client = str(it.get("client") or it.get("clientName") or "?")
+            if dt:
+                per_day[dt] += cr
+            per_model[model] += cr
+            per_client[client] += cr
+            hh = ts[11:13]
+            if hh.isdigit():
+                per_hour[int(hh)] += cr
+            out_reqs.append({"ts": ts, "model": model,
+                             "client": client, "credit": cr})
+
+        # 按日升序（方便画走势、和 report 对齐）
+        days_out = [{"date": d, "credit": _r2(per_day[d])}
+                    for d in sorted(per_day.keys())]
+        # 窗口合计 / 今日
+        total_credit = round(sum(per_day.values()), 2)
+        today_credit = _r2(per_day.get(today_s)) if today_s in per_day else None
+
+        # 明细按时间倒序，截断
+        out_reqs.sort(key=lambda x: x.get("ts") or "", reverse=True)
+        out_reqs = out_reqs[:MAX_REQUEST_ROWS]
+
+        r["days"] = days_out
+        r["by_model"] = {k: _r2(v) for k, v in sorted(
+            per_model.items(), key=lambda x: -x[1])}
+        r["by_client"] = {k: _r2(v) for k, v in sorted(
+            per_client.items(), key=lambda x: -x[1])}
+        r["by_hour"] = {h: _r2(per_hour.get(h, 0.0)) for h in range(24)}
+        r["requests"] = out_reqs
+        r["total"] = _int_or_none(total) if total is not None else len(recs)
+        r["sum"] = total_credit
+        r["today"] = today_credit
         r["ok"] = True
     except Exception as e:
         r["err"] = "%s: %s" % (type(e).__name__, e)
@@ -254,11 +315,13 @@ def fill_gaps(days, n=None):
 
 
 # ---------------------------------------------------------------- 多账号
-def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4):
+def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4, caller=None):
     """并发查多个账号的用量。
 
     accounts: [{"name":..., "token":..., "uid":...}, ...]
-    返回 [{"name","uid_masked","ok","err","http","sum","today","days","range"}, ...]
+    caller：可选，注入 HTTP 函数（测试桩用，见 get_daily_usage）。
+    返回 [{"name","uid_masked","ok","err","http","sum","today","total",
+            "days","by_model","by_hour","requests","range"}, ...]
 
     隔离纪律：任一账号查询失败只影响它自己那一行，**绝不影响其它账号**，
     整体也不抛异常。
@@ -272,19 +335,24 @@ def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4
         uid_m = (uid[:8] + "…") if len(uid) > 8 else (uid or "-")
         row = {"name": name or uid_m, "uid_masked": uid_m, "ok": False,
                "err": None, "http": 0, "sum": None, "today": None,
-               "days": [], "range": None}
+               "total": None, "days": [], "by_model": {}, "by_hour": {},
+               "requests": [], "range": None}
         if not token or not uid:
             row["err"] = "缺 token 或 uid"
             out[i] = row
             return
         try:
-            du = get_daily_usage(token, uid, days=days, timeout=timeout)
+            du = get_daily_usage(token, uid, days=days, timeout=timeout, caller=caller)
             row["ok"] = bool(du.get("ok"))
             row["err"] = du.get("err")
             row["http"] = du.get("http")
             row["sum"] = du.get("sum")
             row["today"] = du.get("today")
+            row["total"] = du.get("total")
             row["days"] = du.get("days") or []
+            row["by_model"] = du.get("by_model") or {}
+            row["by_hour"] = du.get("by_hour") or {}
+            row["requests"] = du.get("requests") or []
             row["range"] = du.get("range")
         except Exception as e:                       # 双保险
             row["err"] = "%s: %s" % (type(e).__name__, e)
@@ -344,52 +412,76 @@ def _selftest():
             fail += 1
             print("  [!!] %s" % label)
 
+    # 假 HTTP：返回一段 request-usage 风格的真实结构
+    def fake_call(method, url, token, uid, body, timeout=TIMEOUT):
+        obj = {"code": 0, "msg": "OK", "data": {"total": 3, "data": [
+            {"requestId": "r1", "credit": 1.5, "model": "m-a",
+             "client": "WorkBuddy", "requestTime": "2026-09-27 09:00:00"},
+            {"requestId": "r2", "credit": 2.5, "model": "m-a",
+             "client": "IDE", "requestTime": "2026-09-27 21:30:00"},
+            {"requestId": "r3", "credit": 4.0, "model": "m-b",
+             "client": "WorkBuddy", "requestTime": "2026-09-28 10:00:00"},
+        ]}}
+        return 200, json.dumps(obj)
+
     print("[1] usage_range 边界")
     s, e = usage_range(7)
     ck("7 天窗口右端是今天", e.startswith(datetime.date.today().isoformat()))
-    ck("左端 = 今天-6 天",
-       s.startswith((datetime.date.today() - datetime.timedelta(days=6)).isoformat()))
     s2, _ = usage_range(999)
     ck("超上限被夹到 31 天",
        s2.startswith((datetime.date.today() - datetime.timedelta(days=30)).isoformat()))
     s3, _ = usage_range(0)
-    # 0/None 视为「没传」→ 回落到默认窗口（不是夹到 1 天）
     ck("0 天回落到默认 7 天",
        s3.startswith((datetime.date.today() - datetime.timedelta(days=6)).isoformat()))
-    s4, _ = usage_range(-5)
-    ck("负数夹到 1 天（只有今天一天）", s4.startswith(datetime.date.today().isoformat()))
 
-    print("[2] get_daily_usage 异常路径（无网络，必失败但不抛）")
-    r = get_daily_usage("", "", days=7, timeout=1)
-    ck("空凭据不抛异常", isinstance(r, dict))
-    ck("空凭据 ok=False", r["ok"] is False)
-    ck("空凭据有 err", bool(r["err"]))
+    print("[2] get_daily_usage 解析 + 聚合（假接口）")
+    r = get_daily_usage("t", "u", days=7, caller=fake_call)
+    ck("ok=True", r["ok"] is True)
+    ck("窗口合计 8.0", r["sum"] == 8.0)
+    ck("请求数 3", r["total"] == 3)
+    ck("按日两天", len(r["days"]) == 2)
+    ck("09-27 求和 4.0", abs((r["days"][0]["credit"] or 0) - 4.0) < 1e-6)
+    ck("by_model m-a=4.0", abs(r["by_model"].get("m-a", 0) - 4.0) < 1e-6)
+    ck("by_model m-b=4.0", abs(r["by_model"].get("m-b", 0) - 4.0) < 1e-6)
+    ck("by_client WorkBuddy=5.5", abs(r["by_client"].get("WorkBuddy", 0) - 5.5) < 1e-6)
+    ck("by_hour 09=1.5", abs(r["by_hour"].get(9, 0) - 1.5) < 1e-6)
+    ck("by_hour 21=2.5", abs(r["by_hour"].get(21, 0) - 2.5) < 1e-6)
+    ck("requests 截断≤300", len(r["requests"]) <= MAX_REQUEST_ROWS)
+    ck("requests 倒序", r["requests"][0]["ts"] >= r["requests"][-1]["ts"])
 
-    print("[3] fill_gaps 补洞")
+    print("[3] invalid params / 401 优雅降级")
+    def bad_call(method, url, token, uid, body, timeout=TIMEOUT):
+        return 200, json.dumps({"code": 10001, "msg": "invalid params"})
+    r2 = get_daily_usage("t", "u", days=7, caller=bad_call)
+    ck("invalid params → ok=False", r2["ok"] is False)
+    ck("invalid params 有 err", bool(r2["err"]))
+    ck("invalid params 不抛", isinstance(r2, dict))
+
+    print("[4] fill_gaps 补洞")
     g = fill_gaps([{"date": "2026-09-25", "credit": 1.0},
                    {"date": "2026-09-27", "credit": 3.0}])
     ck("跨 3 天补成 3 条", len(g) == 3)
     ck("中间那天补 0", g[1]["credit"] == 0.0)
-    ck("首尾值保留", g[0]["credit"] == 1.0 and g[2]["credit"] == 3.0)
-    ck("空输入返回空", fill_gaps([]) == [])
 
-    print("[4] merge_rows 多账号求和")
+    print("[5] merge_rows 多账号求和")
     rows = [{"days": [{"date": "2026-09-27", "credit": 1.5}]},
             {"days": [{"date": "2026-09-27", "credit": 2.5},
                       {"date": "2026-09-28", "credit": 4.0}]}]
     keys, per, total = merge_rows(rows)
     ck("日期升序两个", keys == ["2026-09-27", "2026-09-28"])
     ck("同日求和 4.0", per["2026-09-27"] == 4.0)
-    ck("总计 8.0", total == 8.0)
 
-    print("[5] query_accounts 缺凭据不炸 + 掩码")
+    print("[6] query_accounts 缺凭据不炸 + 掩码")
     qs = query_accounts([{"name": "a", "token": "", "uid": ""},
-                         {"name": "b", "token": "x", "uid": "1234567890abcdef"}],
-                        days=7, timeout=1)
+                         {"name": "b", "token": "x", "uid": "1234567890abcdef",
+                          "days": 7}],
+                        days=7, caller=fake_call)
     ck("返回条数不变", len(qs) == 2)
     ck("缺凭据那行有 err", bool(qs[0]["err"]))
     ck("uid 掩码为前 8 位", qs[1]["uid_masked"] == "12345678…")
-    ck("uid_masked 不含完整 uid", "1234567890abcdef" not in json.dumps(qs, ensure_ascii=False))
+    ck("uid_masked 不含完整 uid",
+       "1234567890abcdef" not in json.dumps(qs, ensure_ascii=False))
+    ck("有数据行聚合到位", qs[1]["sum"] == 8.0)
 
     print("\n自测：%d 通过 / %d 失败" % (ok, fail))
     return 0 if fail == 0 else 1

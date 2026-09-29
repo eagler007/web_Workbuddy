@@ -69,7 +69,7 @@ workbuddy 容器
     ├── /            总览，含「立即运行」按钮和最近记录
     ├── /accounts    账号增删改 + 测活 + 推送通道状态
     ├── /report      历史报告（每次刷新实时渲染）
-    ├── /logs        最近一次运行的输出
+    ├── /logs        运行日志（按天历史归档，默认当日，可查任意一天）
     ├── /update      版本比对 + 更新命令
     └── /healthz     健康检查
 ```
@@ -264,8 +264,8 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 | 兑换汇总 | `GET  https://www.workbuddy.cn/v2/activity/growth/redeem/summary` |
 | 兑换连登奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/redeem`，body `{"tier":"…","client_token":"…"}` |
 | 用补登卡 | `POST https://www.workbuddy.cn/v2/activity/growth/makeup-cards/use`，body `{"target_date":"YYYY-MM-DD"}` |
-| **每日用量** | `POST https://www.codebuddy.cn/billing/meter/get-user-daily-usage`，body `{"startTime":"YYYY-MM-DD 00:00:00","endTime":"YYYY-MM-DD 23:59:59","pageNum":1,"pageSize":100}` |
-| 请求级明细 | `POST https://www.codebuddy.cn/billing/meter/get-user-request-usage`，参数同上 |
+| **用量（请求级明细）** | `POST https://www.codebuddy.cn/billing/meter/get-user-request-usage`（**不带 /v2**），body `{"startTime":"YYYY-MM-DD 00:00:00","endTime":"YYYY-MM-DD 23:59:59","pageNum":1,"pageSize":500}`；返回 `data.data[]`（每条含 `credit`/`model`/`client`/`requestTime`） |
+| 资源汇总 | `POST https://www.codebuddy.cn/billing/meter/get-user-resource-summary`，参数同上 |
 | 资源汇总 | `POST https://www.codebuddy.cn/billing/meter/get-user-resource-summary`，参数同上 |
 | 猫猫状态 | `GET  https://www.workbuddy.cn/v2/activity/growth/buddy/travel/status` |
 | 领奖励 | `POST https://www.workbuddy.cn/v2/activity/growth/buddy/travel/claim` |
@@ -279,8 +279,7 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 > |---|---|
 > | `get-user-resource`（查余额） | **带** `/v2` |
 > | `daily-checkin`（签到） | **带** `/v2` |
-> | `get-user-daily-usage`（每日用量） | **不带** `/v2` |
-> | `get-user-request-usage` | **不带** `/v2` |
+> | `get-user-request-usage`（用量，真接口） | **不带** `/v2` |
 > | `get-user-resource-summary` | **不带** `/v2` |
 >
 > **症状怎么分**：`404` = 路径不存在（前缀写错）；`401` = 路径对、凭据无效。
@@ -291,7 +290,8 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 > 这些接口名不是猜的，是从产品自己的前端包里挖出来的：
 > - 连登/派猫 → `growthSpace-CCYzF8bt.js`（仅 3.3 KB，整组 API 常量写死）
 > - 每日用量 → `index-BTO2lsRd.js`（786 KB 主包，用量页是**内联**的，顺着「用量明细」
->   文案挖到 `get-user-daily-usage`）
+>   文案挖到 `get-user-request-usage`；**注意 `get-user-daily-usage` 是幻觉接口**，
+>   任何参数都返回 `invalid params`，千万别用）
 >
 > 以后再要找新接口，照这个套路：入口页 → 主包列 chunk → 找几 KB 的常量包；
 > 找不到就回主包里搜**中文 UI 文案**，顺着文案找它旁边的请求调用。
@@ -341,7 +341,8 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 **口径要说清楚**：CodeBuddy 采用**积分计费**，模型调用按系数扣积分 ——
 所以这里统计的是**积分消耗**，不是原始 token 数。接口字段就叫 `credit`。
 
-数据来自 `POST /billing/meter/get-user-daily-usage`（**不带 `/v2`**，写成 `/v2/...` 会 404），
+数据来自 `POST /billing/meter/get-user-request-usage`（**请求级明细接口，不带 `/v2`**，
+写成 `/v2/...` 会 404；`get-user-daily-usage` 是幻觉接口，任何参数都 `invalid params`），
 由 `wb_daily.py` 的 `usage_flow()` 采集，写进归档的 `usage_today` / `usage_days` /
 `usage_sum` / `usage_range` 字段，报告侧纯离线渲染（不联网）。
 
@@ -362,8 +363,20 @@ docker compose pull && docker compose up -d              # 拉最新镜像并重
 
 ## 十三、用量看板（`/usage`，每天早上自动采集）
 
-控制台第二个 Tab「用量」是一个**独立的看板页**：KPI 横排 + 每日走势 + 各账号迷你柱状图 +
-账号明细 + **定时采集历史**。版式照本机 `token-dashboard` 技能的视觉语言来（深浅色、卡片区块）。
+控制台第二个 Tab「用量」是一个**独立的看板页**，版式照本机 `token-dashboard` 技能的视觉语言
+（深浅色、卡片区块、KPI 横排）。自上而下：
+
+1. **KPI 横排**：今日消耗 / 窗口合计 / 日均 / 请求数 / 账号数（可用/总数）。
+2. **窗口切换**：1·3·7·14·30 天药丸 + 「重新查询」强制刷新（缓存 `WB_USAGE_CACHE_TTL` 秒）。
+3. **每日总消耗走势**（折线）+ **每日消耗热力**（日历格，色越深消耗越高）。
+4. **按模型消耗**（横向条）+ **0–24 时分布**（按请求小时聚合）。
+5. **账号明细**：状态 / 今日 / 合计 / 窗口 / 掩码 UID。
+6. **各账号每日消耗**（迷你柱状图）。
+7. **请求级明细**（最近 100 条：时间 / 模型 / 客户端 / 积分，只含统计字段、无凭据）。
+8. **定时采集历史**（见下）。
+
+数据来自 `get-user-request-usage`（请求级明细）：客户端把每条请求按 `requestTime` 按日聚合，
+并切出 `by_model` / `by_client` / `by_hour` / `requests` 明细，供上面这些图直接渲染。
 
 ### 它和报告页那个用量区块有什么区别
 
@@ -413,7 +426,7 @@ docker exec workbuddy /app/deploy/collect_usage.sh
 
 ### 页面上的「查询」和「采集」是两件事
 
-- **打开页面** → 实时调 `get-user-daily-usage`，结果缓存 `WB_USAGE_CACHE_TTL` 秒（默认 60），
+- **打开页面** → 实时调 `get-user-request-usage`（请求级明细），结果缓存 `WB_USAGE_CACHE_TTL` 秒（默认 60），
   点「重新查询」强制刷新。**这一步不落盘**，纯展示。
 - **每天早上 8:10** → `collect_usage.sh` 跑一轮，把结果写进 `usage_history.json`。
   页面下半部分「定时采集历史」读的就是它。
@@ -434,6 +447,18 @@ docker exec workbuddy /app/deploy/collect_usage.sh
 - 这是**积分消耗**，不是原始 token 数。CodeBuddy 按积分计费，字段叫 `credit`。
 - 官方原文「用量数据存在 **2-3 小时**的数据延迟」→ 当天偏小/为空是正常的。
 - 窗口上限 **31 天**，前端硬限制。
+
+### 运行日志历史化（`/logs`）
+
+控制台「日志」页现在**按天保留历史，不再覆盖**：
+
+- 每次 `run_daily.sh` 跑完，当次的完整输出（`last_run.log`）会被 `runlog.py` 按日期
+  追加进 `data/logs/<YYYY-MM-DD>.log`（每条加 `=== 时间戳 ===` 分隔），**永互相覆盖**。
+- 页面**默认显示当日**，顶部有日期选择器，点任意一天查那天的日志。
+- 历史保留 **180 天**（`run_daily.sh` 每次顺手 `--prune`），更早的自动清理。
+- 写入前会打码 `eyJ…`（JWT）/ `SCT…`（推送 key），**日志里绝不含完整凭据**。
+
+相关文件：`docker/runlog.py`（归档逻辑）、`deploy/run_daily.sh`（调用）。
 
 ---
 
@@ -457,6 +482,8 @@ docker/
 │                              控制台与采集器共用；不 import wb_daily
 ├── collect_usage.py           用量采集器：查真实接口 → 落 usage_history.json
 │                              按日期归并（幂等）、只留掩码 UID、不含任何凭据
+├── runlog.py                  运行日志按天归档（ingest/prune/list/read）
+│                              每次签到输出追加进 data/logs/<日期>.log，历史 180 天、不覆盖、打码凭据
 ├── deploy/
 │   ├── entrypoint.sh          起 supercronic + 前台 Web（写两条 cron）
 │   ├── run_daily.sh           签到+派猫+连登+用量+报告+推送（flock 防重叠）
@@ -508,7 +535,8 @@ DATA_DIR=./data python3 collect_usage.py --days 7 --print --dry-run
 |---|---|
 | `test_theme_notify.py` | 主题机制 / 旧归档降级 / 通知渲染 / 时机判定 / key 不泄漏 / 控制台页面 / 单次报告 |
 | `test_notify_e2e.py` | 起本地 mock HTTP 服务，真发一次推送，验 JSON 形状 + 自定义模板 + 坏模板隔离 + 不可达不炸 |
-| `test_usage_dashboard.py` | **用量看板**：窗口边界 / 补洞 / 多账号求和 / 采集幂等 / 落盘不含凭据 / 页面各区块 / 历史降级 / 图表除零与转义 |
+| `test_usage_dashboard.py` | **用量看板**：窗口边界 / 补洞 / 多账号求和 / 采集幂等 / 落盘不含凭据 / 页面各区块 / 历史降级 / 图表除零与转义 / 前缀自适应 |
+| `test_runlog.py` | **日志历史化 + 签到误判修复**：按天归档不覆盖 / 不写凭据 / 180 天清理；`_is_ok` 优先 `ok` 布尔、服务端 `OK` 判成功 |
 | `test_redeem_plan.py` | 连登兑换计划（纯函数） |
 | `test_usage.py` / `test_usage_report.py` | 用量接口解析 / 面板渲染 |
 | `test_report_streak.py` | 连登渲染 / 降级 / 今日判定 / token 泄漏 / XSS |

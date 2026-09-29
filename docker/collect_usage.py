@@ -107,7 +107,12 @@ def save_history(h, path=None):
 
 
 def slim_rows(rows, keep_series=True):
-    """把查询结果精简成落盘形态（**去掉一切凭据**，只留展示需要的）。"""
+    """把查询结果精简成落盘形态（**去掉一切凭据**，只留展示需要的）。
+
+    2026-09-29 起：用量接口换成 get-user-request-usage（请求级明细），
+    聚合出 by_model / by_hour / total。这些只是统计值，不含任何凭据，一并落盘，
+    方便历史页直接画「按模型」分布，不必回源重查。
+    """
     out = []
     for r in rows or []:
         item = {
@@ -118,7 +123,10 @@ def slim_rows(rows, keep_series=True):
             "http": r.get("http"),
             "sum": r.get("sum"),
             "today": r.get("today"),
+            "total": r.get("total"),
             "range": r.get("range"),
+            "by_model": r.get("by_model") or {},
+            "by_hour": r.get("by_hour") or {},
         }
         if keep_series:
             item["series"] = [{"date": (it.get("date") or "")[:10],

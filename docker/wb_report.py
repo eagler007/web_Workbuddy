@@ -393,13 +393,23 @@ C_AX_R = "var(--ok)"
 def _is_ok(a):
     """判断某账号这一次是否签到成功。
 
-    成功口径：QD 模板抓到的 msg 里含「已签到」或「签到成功」。
-    ⚠️ 老版本模板有个 bug：msg 变量名对不上（模板写 sign_msg、日志读 msg_N），
-    导致日志恒显示「无返回」。这种旧记录按"未知"处理，不算成功也不标失败。
+    成败口径（2026-09-29 修正）：
+      1) **优先用显式 `ok` 布尔** —— 自 2026-09-29 起 `wb_daily.make_run` 已写入
+         `ok`，这是唯一权威判据。
+      2) 老记录没有 `ok` 字段 → 退回文案判：
+         - 服务端成功标志是英文 **"OK"**（和 get-user-resource 一个风格），直接判成功；
+         - 含「已签到」或「成功」也判成功；
+         - 空 / 「无返回」→ 未知（不算成功也不标失败）。
+
+    ⚠️ 之前只靠文案，导致服务端返回 `msg="OK"` 的真·成功记录被误判成「未成功/失败」。
     """
+    if isinstance(a, dict) and "ok" in a and a["ok"] is not None:
+        return bool(a["ok"])
     ck = (a.get("checkin") or "").strip()
     if not ck or ck == "无返回":
         return None
+    if ck == "OK":                      # 服务端成功标志
+        return True
     return ("已签到" in ck) or ("成功" in ck)
 
 

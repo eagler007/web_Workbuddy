@@ -245,6 +245,26 @@ def _r2(v):
     return round(v, 2)
 
 
+# 服务端「成功」文案的等价写法（大小写不敏感，**整串相等**才算，别用子串匹配：
+# "TOKEN" 里就含 "OK"）
+_OK_TEXTS = ("OK", "SUCCESS", "TRUE", "SIGNED")
+
+
+def _checkin_text(ck):
+    """把签到结果压成一句人能读的文案（只用于展示，成败看 ok 布尔）。
+
+    服务端风格：正常签到成功返回 `msg="OK"`；重复签到返回
+    `{"code":10001,"msg":"今天已签到，请明天再来"}`。前者直白写出来很别扭，
+    这里统一渲染成「签到成功」。
+    """
+    msg = (ck.get("msg") or "").strip()
+    if ck.get("ok"):
+        if (not msg) or msg.upper() in _OK_TEXTS:
+            return "签到成功"
+        return msg
+    return msg or "签到失败"
+
+
 def make_run(ts_iso, accounts, cat, note, success=True):
     """把一次运行拼成归档记录（结构与 wb_report.py 完全一致）。"""
     a_list = []
@@ -282,7 +302,12 @@ def make_run(ts_iso, accounts, cat, note, success=True):
         a_list.append({
             "name": a["name"],
             "uid": a["uid"],
-            "checkin": ck.get("msg") or ("签到成功" if ck.get("ok") else "签到失败"),
+            # ⚠️ **必写显式 ok**（2026-09-29 踩坑）：
+            # 服务端签到成功时 `msg` 是英文 **"OK"**（和 get-user-resource 一个风格），
+            # 报告侧若只靠文案里有没有「成功/已签到」判成败 → 真·签到成功反而被标成「未成功」。
+            # 所以成败一律以 `ok` 布尔为准，文案只用于展示。
+            "ok": bool(ck.get("ok")),
+            "checkin": _checkin_text(ck),
             "credit": ck.get("credit"),
             "streak": ck.get("streak"),
             "before": before,
@@ -1081,7 +1106,7 @@ def render_html(ctx):
                 uid=html.escape(a["uid"]),
                 acc=html.escape(a["name"]),
                 cls="ok" if ok else "fail",
-                status="已领取" if ok else "失败",
+                status="签到成功" if ok else "签到失败",
                 ccls="credit" if credit else "credit zero",
                 credit=("+%g" % credit) if credit else "+0",
                 streak=("%s天" % ck["streak"]) if ck.get("streak") is not None else "—",
@@ -1095,7 +1120,7 @@ def render_html(ctx):
             ("uid", a["uid"]),
             ("RT", ("%s 天" % a["rt_days"]) if a.get("rt_days") is not None else "—"),
             ("AT", ("%s 天" % a.get("at_days")) if a.get("at_days") is not None else "—"),
-            ("签到结果", ck.get("msg") or ("成功" if ok else "失败")),
+            ("签到结果", _checkin_text(ck)),
             ("本次积分", ("+%g" % _r2(ck.get("credit"))) if ck.get("credit") else "+0"),
             ("连续天数", ("%s 天" % ck["streak"]) if ck.get("streak") is not None else "—"),
             ("签到前 → 签到后", "%s → %s" % (a.get("before"), a.get("after"))),

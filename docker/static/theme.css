@@ -311,6 +311,41 @@ svg.spark { display: block; overflow: visible; }
   color: var(--acc-fg); font-weight: 600;
 }
 
+/* 日历热力矩阵（参考 token-dashboard 版式） */
+.heat {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+  gap: 6px;
+}
+.heatcell {
+  background: var(--card2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 8px; text-align: center; min-width: 0;
+}
+.heatcell .hblock { height: 26px; border-radius: 5px; background: var(--chart-bar); }
+.heatcell .hdate { font-size: 10.5px; color: var(--mut); margin-top: 5px; }
+.heatcell .hval { font-size: 12.5px; font-weight: 700; color: var(--fg); }
+
+/* 横向条形图（按模型 / 按时段） */
+.hbars { display: flex; flex-direction: column; gap: 6px; }
+.hbar {
+  display: grid; grid-template-columns: 130px 1fr 64px; align-items: center; gap: 8px;
+}
+.hbar .hl {
+  font-size: 12px; color: var(--mut); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; text-align: right;
+}
+.hbar .htrack {
+  background: var(--card2); border-radius: 6px; height: 16px; overflow: hidden;
+  border: 1px solid var(--line);
+}
+.hbar .hfill {
+  display: block; height: 100%; background: var(--chart-bar);
+  border-radius: 6px 0 0 6px; min-width: 2px;
+}
+.hbar .hv { font-size: 12px; color: var(--fg); font-weight: 600; text-align: left; }
+@media (max-width: 720px) {
+  .hbar { grid-template-columns: 92px 1fr 56px; }
+}
+
 /* 每账号一块迷你柱状图 */
 .upanel { padding: 10px 16px 4px; border-top: 1px solid var(--line); }
 .upanel:first-of-type { border-top: none; }
