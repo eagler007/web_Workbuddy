@@ -477,9 +477,14 @@ docker exec workbuddy /app/deploy/collect_usage.sh
 - 日志内容是**紧凑版**：`balance_before/after` 的巨大响应体只记一行 HTTP 状态，
   另给一行「余额构成: 套餐 X + 购买 Y + 平台奖励 Z; 前 A -> 后 B」；
   `checkin` 短 body 保留完整（签到成败判据）。想看完整响应去「报告」页。
+- **展示层再兜一道（分块折叠 + 单行截断）**：历史归档里的老块可能还带着修复前的
+  巨型 JSON（那是当天早些时候旧版本写进去的，文件不可回炉），所以渲染时：
+  - 每次运行 = 一个可折叠块（`<details>`），**最新一块默认展开**，其余收起；
+  - 单行超过 `WB_LOG_LINE_CLIP`（默认 480）字符自动截断并标注。
+  这样无论归档里有什么历史脏数据，日志页都不会被刷屏。
 
 相关文件：`docker/runlog.py`（归档逻辑）、`docker/wb_daily.py`（调用 ingest）、
-`deploy/run_daily.sh`（只负责 `--prune`）。
+`docker/app.py`（`_render_log_blocks` / `_clip_line`）、`deploy/run_daily.sh`（只负责 `--prune`）。
 
 ---
 
@@ -561,6 +566,7 @@ DATA_DIR=./data python3 collect_usage.py --days 7 --print --dry-run
 | `test_runlog.py` | **日志历史化 + 签到误判修复**：按天归档不覆盖 / 不写凭据 / 180 天清理；`_is_ok` 优先 `ok` 布尔、服务端 `OK` 判成功 |
 | `test_compact_log.py` | **紧凑日志**：巨大 balance 响应不落盘、checkin 保留、余额构成一行、不泄漏套餐字段 |
 | `test_self_archive.py` | **wb_daily 自归档（E2E）**：桩掉网络跑 main() → `data/logs/今天.log` 生成、内容紧凑、重复跑只追加一块 |
+| `test_log_render.py` | **日志页渲染**：按运行块折叠（最新默认展开）/ 巨型单行截断 / HTML 转义 / 来源标签可读化 |
 | `test_redeem_plan.py` | 连登兑换计划（纯函数） |
 | `test_usage.py` / `test_usage_report.py` | 用量接口解析 / 面板渲染 |
 | `test_report_streak.py` | 连登渲染 / 降级 / 今日判定 / token 泄漏 / XSS |

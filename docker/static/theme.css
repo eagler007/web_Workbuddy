@@ -226,6 +226,25 @@ pre {
   white-space: pre-wrap; word-break: break-all; color: var(--fg); margin: 0;
 }
 
+/* ---------------------------------------------------- 运行日志：分块折叠 */
+.logblk {
+  border: 1px solid var(--line); border-radius: 10px;
+  margin: 0 16px 10px; background: var(--card2); overflow: hidden;
+}
+.logblk > summary {
+  cursor: pointer; padding: 9px 12px; font-size: 13px; color: var(--fg);
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  list-style: none; user-select: none;
+}
+.logblk > summary::-webkit-details-marker { display: none; }
+.logblk > summary::before { content: "▸"; color: var(--mut2); font-size: 11px; }
+.logblk[open] > summary::before { content: "▾"; }
+.logblk[open] > summary { border-bottom: 1px solid var(--line); }
+.logblk > summary > b { font-weight: 600; font-family: ui-monospace, Consolas, monospace; }
+.logblk.new { border-color: var(--acc); }
+.logblk.new > summary > b { color: var(--acc); }
+.logblk pre { border: 0; border-radius: 0; max-height: 520px; }
+
 /* 提示条 */
 .msg { padding: 9px 12px; border-radius: 9px; margin-bottom: 14px; font-size: 13px; }
 .msg.ok { background: var(--ok-bg); border: 1px solid var(--ok); color: var(--ok); }

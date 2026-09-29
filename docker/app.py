@@ -441,6 +441,22 @@ def page(title, body, on="", msg="", nonce="", extra_head="", extra_body=""):
         _theme_js(), extra_body)
 
 
+def _source_label(note):
+    """把归档里的 task_note（manual:all / manual:<uid> / docker）翻成人话。"""
+    n = (note or "").strip()
+    if n == "docker":
+        return "定时 · docker"
+    if n.startswith("manual:"):
+        who = n[7:] or "all"
+        if who == "all":
+            return "手动 · 全部账号"
+        for a in load_accounts():
+            if a["uid"] == who or a["name"] == who:
+                return "手动 · " + (a["name"] or who)
+        return "手动 · " + who
+    return n or "—"
+
+
 def view_home(msg="", nonce=""):
     accs = load_accounts()
     runs = []
@@ -488,7 +504,7 @@ def view_home(msg="", nonce=""):
             rows += ("<tr><td class='acc'>%s</td><td>%s</td><td>%s</td><td>%s</td>"
                      "<td>%s</td></tr>") % (
                 html.escape(str(r.get("date", ""))),
-                html.escape(str(r.get("task_note", ""))),
+                html.escape(_source_label(r.get("task_note", ""))),
                 html.escape(str(len(r.get("accounts", [])))),
                 html.escape(str(s.get("diff", "—"))),
                 html.escape(str(s.get("after", "—"))))
@@ -632,6 +648,57 @@ def view_report(msg=""):
     return page("报告", body, on="/report", msg=msg, nonce="")
 
 
+# ---- 日志分块渲染（折叠 + 单行截断）----------------------------------------
+# 为什么要在**展示层**再兜一道：老版本归档进 data/logs/ 的日志里，balance
+# 响应体是几十条套餐的完整 JSON（单行几万字符）。那种历史块没法回炉重写
+# （改用户数据风险高），但渲染时必须限制，否则一打开日志页就被刷屏。
+_LOG_TS_RE = re.compile(r"^===\s*(.+?)\s*===\s*$", re.M)
+LOG_LINE_CLIP = int(os.environ.get("WB_LOG_LINE_CLIP") or 480)
+
+
+def _fmt_size(n):
+    if n >= 1024 * 1024:
+        return "%.1f MB" % (n / 1024.0 / 1024.0)
+    if n >= 1024:
+        return "%.1f KB" % (n / 1024.0)
+    return "%d B" % n
+
+
+def _clip_line(line, limit=LOG_LINE_CLIP):
+    """单行过长就截断（保留行首，够看清是哪个请求/哪条报错）。"""
+    if len(line) <= limit:
+        return line
+    return line[:limit] + "  …[本行共 %s，已截断]" % _fmt_size(len(line))
+
+
+def _render_log_blocks(raw):
+    """把按天归档的文本渲染成可折叠的块列表；**最新一块默认展开**，其余折叠。"""
+    txt = (raw or "").strip()
+    if not txt:
+        return "<div class='sub' style='margin:0 16px 16px'>（这一天还没有运行日志）</div>"
+    body_lines = lambda body: "\n".join(_clip_line(l) for l in body.split("\n"))
+    parts = _LOG_TS_RE.split(txt)
+    rest = parts[1:]
+    blocks = [(rest[i].strip(), rest[i + 1].strip())
+              for i in range(0, len(rest) - 1, 2)]
+    if not blocks:
+        # 没有 === 分隔：迁移前的 last_run.log，或单次原始输出
+        return ("<details class='logblk new' open><summary><b>本次运行</b>"
+                "<span class='mutd'>%s</span></summary><pre>%s</pre></details>"
+                % (html.escape(_fmt_size(len(txt))), html.escape(body_lines(txt))))
+    out = []
+    last = len(blocks) - 1
+    for idx, (ts, body) in enumerate(blocks):
+        new = idx == last
+        out.append(
+            "<details class='logblk%s'%s><summary><b>%s</b>"
+            "<span class='mutd'>%d 行 · %s%s</span></summary><pre>%s</pre></details>"
+            % (" new" if new else "", " open" if new else "",
+               html.escape(ts), len(body.split("\n")), _fmt_size(len(body)),
+               " · 最新" if new else "", html.escape(body_lines(body))))
+    return "".join(out)
+
+
 def view_logs(msg="", nonce="", date=None):
     """运行日志页：历史按天保留，默认显示当日，可 ?date=YYYY-MM-DD 查任意一天。"""
     try:
@@ -650,10 +717,8 @@ def view_logs(msg="", nonce="", date=None):
                 raw = f.read()
         except Exception:
             raw = ""
-    if not raw:
-        raw = "（这一天还没有运行日志）"
     # 凭据打码（二次防线）
-    txt = re.sub(r"eyJ[A-Za-z0-9._\-]{20,}", "***REDACTED***", raw)
+    txt = re.sub(r"eyJ[A-Za-z0-9._\-]{20,}", "***REDACTED***", raw or "")
     txt = re.sub(r"\bSCT[A-Za-z0-9]{6,}", "***REDACTED***", txt)
     # 日期选择器
     chips = ""
@@ -664,11 +729,11 @@ def view_logs(msg="", nonce="", date=None):
                       % (on, html.escape(d), html.escape(d)))
     sel = ('<div class="chips" style="margin:0 16px 12px">%s</div>' % chips) if chips else ""
     body = """<div class="panel"><h3>运行日志</h3>
-<div class="sub">历史日志按天保留 180 天，默认显示当日；点上面的日期查任意一天。</div>
+<div class="sub">历史日志按天保留 180 天，默认显示当日；点上面的日期查任意一天。
+每次运行单独成块，<b>最新一次默认展开</b>，点标题可展开/收起。</div>
 %s
 <div class="sub" style="margin:10px 16px 4px">当前：<b>%s</b>（共 %d 天有记录）</div>
-<pre style="margin:0 16px 16px">%s</pre></div>""" % (
-        sel, html.escape(date), len(dates), html.escape(txt))
+%s</div>""" % (sel, html.escape(date), len(dates), _render_log_blocks(txt))
     return page("日志", body, on="/logs", msg=msg, nonce=nonce)
 
 
