@@ -124,6 +124,14 @@ class Config:
 
 
 # ---------------------------------------------------------------- 摘要（纯函数）
+def at_warn_days():
+    """Token 到期提醒阈值（天），WB_TOKEN_EXPIRE_WARN_DAYS 可调，默认 7。"""
+    try:
+        return max(0, min(60, int(_env("WB_TOKEN_EXPIRE_WARN_DAYS", "7") or 7)))
+    except Exception:
+        return 7
+
+
 def build_summary(results, ok_count, total_credit, total_after, cost, args=None):
     """把一次运行的结果压成一个扁平 dict。
 
@@ -165,6 +173,7 @@ def build_summary(results, ok_count, total_credit, total_after, cost, args=None)
             "cat_depart": cat.get("depart"),
             "redeem": redeem,
             "usage_today": du.get("today") if du.get("ok") else None,
+            "at_left": r.get("at_days"),
         })
 
     tiers = []
@@ -183,6 +192,7 @@ def build_summary(results, ok_count, total_credit, total_after, cost, args=None)
         "cost": cost,
         "accounts": accs,
         "redeem_counts": tiers,
+        "at_warn_days": at_warn_days(),
         "dry": bool(getattr(args, "dry_run", False)) if args else False,
     }
 
@@ -205,12 +215,26 @@ def verdict_of(s):
     return "部分成功 %d/%d · +%g 积分" % (ok, n, cr)
 
 
+def expiring_accounts(s):
+    """摘要里「Token 快到期」的账号（at_left ≤ 阈值），按剩余天数升序。"""
+    warn = s.get("at_warn_days")
+    if warn is None:
+        return []
+    return sorted((a for a in (s.get("accounts") or [])
+                   if a.get("at_left") is not None and a["at_left"] <= warn),
+                  key=lambda a: a["at_left"])
+
+
 def render_text(s):
     """把摘要渲染成 Server 酱的 Markdown 正文（纯函数，方便单测）。
 
     返回 (title, desp)。desp 是 Markdown，Server 酱支持。
     """
     title = verdict_of(s)
+    exps = expiring_accounts(s)
+    if exps:
+        mn = exps[0]["at_left"]
+        title += (" · ⚠️Token最快%d天到期" % mn) + ("，该换了" if mn <= 3 else "")
     L = []
     L.append("**时间**：%s" % s.get("ts", "-"))
     L.append("**结果**：%s" % title)
@@ -266,6 +290,15 @@ def render_text(s):
             L.append("- **%s**：%s" % (_esc(a.get("name")), _fmt(a.get("usage_today"))))
         L.append("")
         L.append("> 口径：积分消耗（模型调用按系数扣积分，非原始 token）。官方提示有 2-3 小时延迟。")
+    # Token 到期提醒（≤ WB_TOKEN_EXPIRE_WARN_DAYS 天才出现；≤3 天红牌）
+    if exps:
+        L.append("")
+        L.append("### ⚠️ Token 即将到期")
+        L.append("")
+        for a in exps:
+            lvl = "🔴" if a["at_left"] <= 3 else "🟡"
+            L.append("- %s **%s**：还剩 %d 天，尽快到网页「账号」页用同一 UID 换新" % (
+                lvl, _esc(a.get("name")), a["at_left"]))
     L.append("")
     L.append("---")
     L.append("由 WorkBuddy 每日助手自动推送")

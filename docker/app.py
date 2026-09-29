@@ -710,12 +710,117 @@ def _local_revision():
     return ""
 
 
+# ---- GHCR 匿名兜底 ---------------------------------------------------------
+# 仓库是私有的：GitHub API 匿名访问必 404（跟额度无关）。但镜像包是**公开**的
+# （飞牛不登录也能 pull），而且工作流给每次构建都打了 <commit-sha> tag ——
+# 所以「:latest 的 manifest digest == 哪个 sha tag 的 digest」，那个 tag 就
+# 是远端最新构建，全程匿名、零 token。
+GHCR_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _ghcr_repo():
+    return GITHUB_REPO.lower()
+
+
+def _ghcr_token(timeout=10):
+    """匿名拿 GHCR 的 pull token（registry 网关的匿名 token，非 GitHub 账号）。"""
+    ok, data, _ = _http_json(
+        "https://ghcr.io/token?scope=repository:%s:pull" % _ghcr_repo(),
+        timeout=timeout)
+    if ok and isinstance(data, dict):
+        return data.get("token") or None
+    return None
+
+
+def _ghcr_manifest(repo, ref, token, timeout=10, method="GET"):
+    """取 manifest；返回 (Docker-Content-Digest 头, 响应体 dict 或 None)。"""
+    url = "https://ghcr.io/v2/%s/manifests/%s" % (repo, ref)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Accept": GHCR_ACCEPT,
+        "Authorization": "Bearer " + token}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            dig = resp.headers.get("Docker-Content-Digest") or None
+            body = None
+            if method != "HEAD":
+                try:
+                    body = json.loads(resp.read().decode("utf-8", "replace"))
+                except Exception:
+                    body = None
+            return dig, body
+    except Exception:
+        return None, None
+
+
+def _ghcr_created(repo, token, index_body, timeout=10):
+    """从镜像 config blob 里拿构建时间（拿不到就算了，不影响主流程）。"""
+    try:
+        for m in (index_body or {}).get("manifests") or []:
+            p = m.get("platform") or {}
+            if p.get("os") == "linux" and p.get("architecture") == "amd64":
+                _, mbody = _ghcr_manifest(repo, m.get("digest"), token, timeout)
+                cfg = (mbody or {}).get("config") or {}
+                if cfg.get("digest"):
+                    ok, blob, _ = _http_json(
+                        "https://ghcr.io/v2/%s/blobs/%s" % (repo, cfg["digest"]),
+                        timeout=timeout, token=token)
+                    if ok and isinstance(blob, dict):
+                        return blob.get("created")
+    except Exception:
+        pass
+    return None
+
+
+def _ghcr_update_info(local, timeout=10):
+    """匿名走 GHCR 判远端最新构建。拿到远端 sha 返回 dict，拿不到返回 None。"""
+    try:
+        repo = _ghcr_repo()
+        token = _ghcr_token(timeout)
+        if not token:
+            return None
+        latest_dig, index_body = _ghcr_manifest(repo, "latest", token, timeout)
+        if not latest_dig:
+            return None
+        remote = None
+        # 快路径：本地 revision 本身就是镜像 tag 之一，HEAD 比一下 digest 即可
+        if local and _SHA_RE.match(local):
+            ldig, _ = _ghcr_manifest(repo, local, token, timeout, method="HEAD")
+            if ldig and ldig == latest_dig:
+                remote = local
+        # 慢路径：扫全部 sha tag，找 digest 与 latest 相同的那个
+        if not remote:
+            ok, tags, _ = _http_json(
+                "https://ghcr.io/v2/%s/tags/list" % repo, token=token, timeout=timeout)
+            for t in (tags or {}).get("tags") or []:
+                if not _SHA_RE.match(t or ""):
+                    continue
+                tdig, _ = _ghcr_manifest(repo, t, token, timeout, method="HEAD")
+                if tdig and tdig == latest_dig:
+                    remote = t
+                    break
+        if not remote:
+            return None
+        return {"remote": remote,
+                "remote_date": _ghcr_created(repo, token, index_body, timeout),
+                "remote_msg": None, "remote_url": None, "via": "ghcr"}
+    except Exception:
+        return None
+
+
 def check_update():
     """查远端最新 commit，和本地比对。
 
     为什么得自己查：飞牛的镜像管理只比 **tag**，而本项目所有构建都用
     :latest —— tag 永远不变，它自然不提示「有新版本」。真正变的是 commit。
-    这里直接问 GitHub API 的 main 分支 HEAD，和本地 WB_REVISION 比。
+
+    两条路：① GitHub API 的 main 分支 HEAD（仓库私有，匿名 404，需 token）；
+    ② GHCR 匿名兜底（默认路，零 token）：比对 :latest 与各 sha tag 的 digest。
     """
     token = os.environ.get("WB_GITHUB_TOKEN", "").strip()
     ok, data, code = _http_json(
@@ -723,18 +828,31 @@ def check_update():
     local = _local_revision()
     r = {"ok": ok, "err": None, "local": local, "remote": None, "remote_date": None,
          "remote_msg": None, "remote_url": None, "behind": None, "repo": GITHUB_REPO,
-         "image": GHCR_IMAGE, "has_token": bool(token)}
-    if not ok:
-        r["err"] = ("查不到远端版本：%s。"
-                    "（GitHub API 匿名访问有次数限制；在 .env 里设 WB_GITHUB_TOKEN "
-                    "可提高额度，只读权限就够。）" % data)
-        return r
-    if isinstance(data, dict):
+         "image": GHCR_IMAGE, "has_token": bool(token), "via": None}
+    if ok and isinstance(data, dict):
+        r["via"] = "github"
         r["remote"] = data.get("sha") or ""
         c = data.get("commit") or {}
         r["remote_date"] = (c.get("committer") or {}).get("date") or ""
         r["remote_msg"] = (c.get("message") or "").split("\n")[0][:120]
         r["remote_url"] = data.get("html_url")
+    else:
+        g = _ghcr_update_info(local)
+        if g:
+            r["ok"] = True
+            r["err"] = None
+            r.update(g)
+        else:
+            if code == 404:
+                why = "仓库是私有的，匿名访问必 404（不是额度问题）"
+            elif code == 403:
+                why = "匿名额度用尽或被限流"
+            else:
+                why = "HTTP %s" % (code or "网络异常")
+            r["err"] = ("查不到远端版本：%s。GHCR 匿名兜底也失败——正常情况无需任何 "
+                        "token 就能比对（镜像包是公开的），走到这步多半是容器出网问题；"
+                        "也可在 .env 设 WB_GITHUB_TOKEN=ghp_…（只读）改走 GitHub API。" % why)
+            return r
     if local and r["remote"]:
         r["behind"] = (local[:12] != r["remote"][:12])
     elif not local:
@@ -766,6 +884,9 @@ def view_update(msg="", nonce="", info=None):
 
     ver = [_row("仓库", _s(info.get("repo"))),
            _row("镜像", _s(info.get("image"))),
+           _row("检查方式", {"github": "GitHub API",
+                             "ghcr": "GHCR 兜底（匿名，无需 token）",
+                             }.get(info.get("via"))),
            _row("本地 commit", _s((info.get("local") or "")[:12])),
            _row("远端 commit", _s((info.get("remote") or "")[:12])),
            _row("远端提交时间", _s(info.get("remote_date"))),
@@ -797,8 +918,10 @@ def view_update(msg="", nonce="", info=None):
 </form>
 <p class="hint" style="padding:0 16px 16px">
   更新完成后回到本页点「重新检查」，两侧 commit 一致就说明成功了。<br>
-  GitHub API 匿名访问有次数限制；在 <code>.env</code> 里加
-  <code>WB_GITHUB_TOKEN=ghp_…</code> 可提高额度（只读权限就够）。
+  仓库是私有的，GitHub API 匿名访问 404 属正常 —— 本页会自动改走
+  <strong>GHCR 匿名兜底</strong>（镜像包是公开的，无需任何 token）。<br>
+  若想显示提交说明等详情，可在 <code>.env</code> 里加
+  <code>WB_GITHUB_TOKEN=ghp_…</code>（只读权限就够）。
 </p>
 </div>""" % (status, "".join(ver), html.escape(cmd), nonce)
     return page("更新", body, on="/update", msg=msg, nonce=nonce)
