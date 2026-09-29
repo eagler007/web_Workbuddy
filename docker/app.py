@@ -853,7 +853,7 @@ def check_update():
     local = _local_revision()
     r = {"ok": ok, "err": None, "local": local, "remote": None, "remote_date": None,
          "remote_msg": None, "remote_url": None, "behind": None, "repo": GITHUB_REPO,
-         "image": GHCR_IMAGE, "has_token": bool(token), "via": None}
+         "image": GHCR_IMAGE, "has_token": bool(token), "via": None, "checked": True}
     if ok and isinstance(data, dict):
         r["via"] = "github"
         r["remote"] = data.get("sha") or ""
@@ -887,14 +887,26 @@ def check_update():
 
 
 def view_update(msg="", nonce="", info=None):
-    """更新页：显示本地 / 远端版本，并给出飞牛上的更新命令。"""
+    """更新页。
+
+    设计：页面加载**不**自动查远端（避免每次进页面都打 GitHub/GHCR）。
+    只渲染本地信息和「检查更新」按钮；点按钮 POST /update/check 才真正查。
+    info=None 表示「尚未检查」，按占位状态渲染。
+    """
     if info is None:
-        info = check_update()
+        info = {"ok": False, "checked": False, "err": None,
+                "local": _local_revision(), "remote": None, "remote_date": None,
+                "remote_msg": None, "remote_url": None, "behind": None,
+                "repo": GITHUB_REPO, "image": GHCR_IMAGE, "via": None,
+                "has_token": bool(os.environ.get("WB_GITHUB_TOKEN", "").strip())}
 
     def _s(v):
         return html.escape(str(v)) if v else "<span class='mut'>—</span>"
 
-    if info.get("behind") is True:
+    if info.get("checked") is False:
+        status = ('<div class="msg">尚未检查远端版本。点下方「检查更新」，比对本机 commit '
+                  '与远端最新构建。</div>')
+    elif info.get("behind") is True:
         status = ('<div class="msg bad">发现新版本：远端 commit 与本地不一致，建议更新。</div>')
     elif info.get("behind") is False:
         status = '<div class="msg ok">已是最新版本（本地 commit 与远端一致）。</div>'
@@ -907,18 +919,21 @@ def view_update(msg="", nonce="", info=None):
                 '<b class="mono" style="font-size:12px">%s</b></div>'
                 % (html.escape(k), v))
 
+    # 未检查时只显示本地信息；查过之后再补上需要远端才有的行
     ver = [_row("仓库", _s(info.get("repo"))),
            _row("镜像", _s(info.get("image"))),
-           _row("检查方式", {"github": "GitHub API",
-                             "ghcr": "GHCR 兜底（匿名，无需 token）",
-                             }.get(info.get("via"))),
-           _row("本地 commit", _s((info.get("local") or "")[:12])),
-           _row("远端 commit", _s((info.get("remote") or "")[:12])),
-           _row("远端提交时间", _s(_to_cn_time(info.get("remote_date")))),
-           _row("远端最新提交", _s(info.get("remote_msg")))]
-    if info.get("remote_url"):
-        ver.append('<div class="kv"><span>查看提交</span><b><a href="%s" target="_blank" '
-                   'rel="noopener">在 GitHub 打开 ↗</a></b></div>' % html.escape(info["remote_url"]))
+           _row("本地 commit", _s((info.get("local") or "")[:12]))]
+    if info.get("checked"):
+        ver.append(_row("检查方式", {"github": "GitHub API",
+                                     "ghcr": "GHCR 兜底（匿名，无需 token）",
+                                     }.get(info.get("via"))))
+        ver.append(_row("远端 commit", _s((info.get("remote") or "")[:12])))
+        ver.append(_row("远端提交时间", _s(_to_cn_time(info.get("remote_date")))))
+        ver.append(_row("远端最新提交", _s(info.get("remote_msg"))))
+        if info.get("remote_url"):
+            ver.append('<div class="kv"><span>查看提交</span><b><a href="%s" target="_blank" '
+                       'rel="noopener">在 GitHub 打开 ↗</a></b></div>'
+                       % html.escape(info["remote_url"]))
 
     cmd = ("cd /vol1/docker/workbuddy\n"
            "docker compose pull\n"
@@ -939,11 +954,11 @@ def view_update(msg="", nonce="", info=None):
 <pre style="margin:0 16px 16px">%s</pre>
 <form method="post" action="/update/check" class="actions" style="padding:0 16px 16px">
 <input type="hidden" name="csrf" value="%s">
-<button type="submit">重新检查</button>
+<button type="submit">检查更新</button>
 </form>
 <p class="hint" style="padding:0 16px 16px">
-  更新完成后回到本页点「重新检查」，两侧 commit 一致就说明成功了。<br>
-  仓库是私有的，GitHub API 匿名访问 404 属正常 —— 本页会自动改走
+  本页默认<strong>不</strong>自动查远端；点「检查更新」才比对本地与远端。<br>
+  仓库是私有的，GitHub API 匿名访问 404 属正常 —— 会自动改走
   <strong>GHCR 匿名兜底</strong>（镜像包是公开的，无需任何 token）。<br>
   若想显示提交说明等详情，可在 <code>.env</code> 里加
   <code>WB_GITHUB_TOKEN=ghp_…</code>（只读权限就够）。
