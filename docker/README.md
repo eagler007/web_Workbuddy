@@ -466,13 +466,20 @@ docker exec workbuddy /app/deploy/collect_usage.sh
 
 控制台「日志」页现在**按天保留历史，不再覆盖**：
 
-- 每次 `run_daily.sh` 跑完，当次的完整输出（`last_run.log`）会被 `runlog.py` 按日期
-  追加进 `data/logs/<YYYY-MM-DD>.log`（每条加 `=== 时间戳 ===` 分隔），**永互相覆盖**。
+- **`wb_daily.py` 自己归档**：每次跑完把当次请求日志追加进 `data/logs/<YYYY-MM-DD>.log`
+  （每块加 `=== 时间戳 ===` 分隔），**永不互相覆盖**。
+  放在 wb_daily 里是关键 —— 这样**任何触发路径都归档**：cron/docker 走 `run_daily.sh`、
+  控制台点「立即运行」走 `app.py` 直接调 wb_daily.py、手工命令行直接跑，全都覆盖。
+  （早期只在 `run_daily.sh` 里归档，导致控制台「立即运行」那次的日志不进日志页。）
 - 页面**默认显示当日**，顶部有日期选择器，点任意一天查那天的日志。
-- 历史保留 **180 天**（`run_daily.sh` 每次顺手 `--prune`），更早的自动清理。
+- 历史保留 **180 天**（`run_daily.sh` 每次顺手 `runlog.py --prune`），更早的自动清理。
 - 写入前会打码 `eyJ…`（JWT）/ `SCT…`（推送 key），**日志里绝不含完整凭据**。
+- 日志内容是**紧凑版**：`balance_before/after` 的巨大响应体只记一行 HTTP 状态，
+  另给一行「余额构成: 套餐 X + 购买 Y + 平台奖励 Z; 前 A -> 后 B」；
+  `checkin` 短 body 保留完整（签到成败判据）。想看完整响应去「报告」页。
 
-相关文件：`docker/runlog.py`（归档逻辑）、`deploy/run_daily.sh`（调用）。
+相关文件：`docker/runlog.py`（归档逻辑）、`docker/wb_daily.py`（调用 ingest）、
+`deploy/run_daily.sh`（只负责 `--prune`）。
 
 ---
 
@@ -497,7 +504,8 @@ docker/
 ├── collect_usage.py           用量采集器：查真实接口 → 落 usage_history.json
 │                              按日期归并（幂等）、只留掩码 UID、不含任何凭据
 ├── runlog.py                  运行日志按天归档（ingest/prune/list/read）
-│                              每次签到输出追加进 data/logs/<日期>.log，历史 180 天、不覆盖、打码凭据
+│                              由 wb_daily.py 每次跑完调用 ingest，写 data/logs/<日期>.log
+│                              历史 180 天、不覆盖、打码凭据
 ├── deploy/
 │   ├── entrypoint.sh          起 supercronic + 前台 Web（写两条 cron）
 │   ├── run_daily.sh           签到+派猫+连登+用量+报告+推送（flock 防重叠）
@@ -551,6 +559,8 @@ DATA_DIR=./data python3 collect_usage.py --days 7 --print --dry-run
 | `test_notify_e2e.py` | 起本地 mock HTTP 服务，真发一次推送，验 JSON 形状 + 自定义模板 + 坏模板隔离 + 不可达不炸 |
 | `test_usage_dashboard.py` | **用量看板**：窗口边界 / 补洞 / 多账号求和 / 采集幂等 / 落盘不含凭据 / 页面各区块 / 历史降级 / 图表除零与转义 / 前缀自适应 |
 | `test_runlog.py` | **日志历史化 + 签到误判修复**：按天归档不覆盖 / 不写凭据 / 180 天清理；`_is_ok` 优先 `ok` 布尔、服务端 `OK` 判成功 |
+| `test_compact_log.py` | **紧凑日志**：巨大 balance 响应不落盘、checkin 保留、余额构成一行、不泄漏套餐字段 |
+| `test_self_archive.py` | **wb_daily 自归档（E2E）**：桩掉网络跑 main() → `data/logs/今天.log` 生成、内容紧凑、重复跑只追加一块 |
 | `test_redeem_plan.py` | 连登兑换计划（纯函数） |
 | `test_usage.py` / `test_usage_report.py` | 用量接口解析 / 面板渲染 |
 | `test_report_streak.py` | 连登渲染 / 降级 / 今日判定 / token 泄漏 / XSS |

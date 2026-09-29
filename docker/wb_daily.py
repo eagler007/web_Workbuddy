@@ -1392,8 +1392,28 @@ def main():
         results.append(r)
         _append_account_log(full_log, r)
 
-    with open(data_path(args.raw_log), "w", encoding="utf-8") as f:
+    raw_log_file = data_path(args.raw_log)
+    with open(raw_log_file, "w", encoding="utf-8") as f:
         f.write("\n".join(full_log))
+
+    # ---- 按天归档运行日志（历史保留、不覆盖）----
+    # 放在 wb_daily 自己里，是为了让**任何**触发路径都归档：
+    #   · cron / docker 走 run_daily.sh
+    #   · Web 界面「立即运行」走 app.py 直接调 wb_daily.py（不经过 run_daily.sh）
+    #   · 手工命令行直接跑
+    # 归档失败只打印一行，绝不影响签到结论与退出码。
+    log_hint = ""
+    try:
+        import runlog as _rl
+        _d, _n = _rl.ingest(raw_log_file)
+        if _d and _n:
+            log_hint = "已归档 data/logs/%s.log" % _d
+            print("运行日志: 已归档到 data/logs/%s.log（%d 字节）" % (_d, _n))
+        else:
+            log_hint = "未归档（无内容）"
+    except Exception as e:
+        log_hint = "归档失败"
+        print("[warn] 运行日志归档失败（不影响签到结论）：%s" % e)
 
     # ---- 汇总
     ok_count = sum(1 for r in results if r["checkin"]["ok"])
@@ -1440,7 +1460,9 @@ def main():
     print(verdict)
     print("总余额: %s" % ctx["balance_text"])
     print("报告: %s" % out)
-    print("原始返回完整版: %s" % data_path(args.raw_log))
+    print("原始返回完整版: %s" % raw_log_file)
+    if log_hint:
+        print("运行日志归档: %s" % log_hint)
     print("历史归档: %s（%s）" % (HISTORY_FILE, hist_hint))
     print("多账号历史报告: 跑 wb_report.py --no-sync 生成")
     print("耗时: %s 秒" % cost)

@@ -23,10 +23,8 @@ echo "[run_daily] 开始 $(date '+%F %T %Z')"
 RC=$?
 echo "[run_daily] wb_daily 退出码 $RC"
 
-# 把当次完整输出按天归档（历史保留、不覆盖；不含凭据）
-"$PY" "$HERE/runlog.py" --ingest "$DATA_DIR/last_run.log" || \
-    echo "[run_daily][warn] 日志归档失败（不影响签到结果）"
-# 顺手清理 180 天前的历史日志
+# 运行日志的按天归档已由 wb_daily.py 自己完成（任何触发路径都归档，避免
+# Web 界面「立即运行」那条路径漏归档）。这里只顺手清理 180 天前的历史。
 "$PY" "$HERE/runlog.py" --prune >/dev/null 2>&1 || true
 
 # 归档已经由 wb_daily.py 写好，这里只把它渲染成聚合报告（离线，不连任何外部服务）
