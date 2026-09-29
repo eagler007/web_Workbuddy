@@ -1307,6 +1307,32 @@ def _split_balance(body):
     return _r2(tc), _r2(buy), _r2(rw)
 
 
+def _append_account_log(full_log, r):
+    """把单个账号的签到/其它请求日志追加进 full_log。
+
+    关键：**balance_before / balance_after 的原始响应体巨大**（get-user-resource 一次返回
+    几十条套餐的完整 JSON，且前后几乎重复），直接写日志会被刷屏成几万字符。
+    这里只记一行 HTTP 状态，真正想要余额构成看「余额构成」摘要行或去报告/用量页。
+    checkin 响应很短、且是签到成败的判定依据，保留完整 body。
+    """
+    for k in ("balance_before", "checkin", "balance_after"):
+        v = r["checkin"]["raw"].get(k)
+        if not v:
+            continue
+        if k == "checkin":
+            full_log.append("\n--- [%s][签到] checkin  HTTP %s -----\n%s"
+                            % (r["name"], v["http"], v["body"]))
+        else:
+            full_log.append("\n--- [%s][签到] %s  HTTP %s（完整响应见报告）-----"
+                            % (r["name"], k, v["http"]))
+    # 余额构成摘要（套餐 / 购买 / 平台奖励）+ 前后结余 —— 一行看清
+    full_log.append("[%s][签到] 余额构成: 套餐 %s + 购买 %s + 平台奖励 %s;  前 %s -> 后 %s"
+                    % (r["name"], r.get("tc"), r.get("buy"), r.get("rw"),
+                       r.get("before"), r.get("after")))
+    for nm, st, body in r["log"]:
+        full_log.append("\n--- [%s] %s  HTTP %s -----\n%s" % (r["name"], nm, st, body))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="只读，不领取/不派出")
@@ -1364,13 +1390,7 @@ def main():
                  "cat": {"ok": False, "err": str(e), "claim": None, "depart": None, "final": None},
                  "log": []}
         results.append(r)
-        for k in ("balance_before", "checkin", "balance_after"):
-            v = r["checkin"]["raw"].get(k)
-            if v:
-                full_log.append("\n--- [%s][签到] %s  HTTP %s -----\n%s"
-                                % (r["name"], k, v["http"], v["body"]))
-        for nm, st, body in r["log"]:
-            full_log.append("\n--- [%s] %s  HTTP %s -----\n%s" % (r["name"], nm, st, body))
+        _append_account_log(full_log, r)
 
     with open(data_path(args.raw_log), "w", encoding="utf-8") as f:
         f.write("\n".join(full_log))
