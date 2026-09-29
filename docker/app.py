@@ -648,12 +648,51 @@ def view_report(msg=""):
     return page("报告", body, on="/report", msg=msg, nonce="")
 
 
-# ---- 日志分块渲染（折叠 + 单行截断）----------------------------------------
-# 为什么要在**展示层**再兜一道：老版本归档进 data/logs/ 的日志里，balance
-# 响应体是几十条套餐的完整 JSON（单行几万字符）。那种历史块没法回炉重写
-# （改用户数据风险高），但渲染时必须限制，否则一打开日志页就被刷屏。
+# ---- 日志渲染：运行块 → 账号卡 → 请求行 ------------------------------------
+# 三层结构：
+#   `=== ts ===`  一次运行 = 一个可折叠块（最新默认展开）
+#   `[账号]`      同一账号的请求归到一张卡
+#   请求行        状态码徽章 + 动作人话 + 响应摘要（尽量不显示原始 JSON）
+# 设计目标：一眼看清「哪个账号、哪一步、成没成、余额变没变」，
+# 而不是面对一坨 `--- [X] Y HTTP 200 -----` 加原始 JSON。
+#
+# 为什么要兼容老格式：归档是**累积**的，老版本写进去的块（`--- [郑] 签到
+# balance_before  HTTP 200 -----`）会一直留在文件里，解析必须两代通吃。
 _LOG_TS_RE = re.compile(r"^===\s*(.+?)\s*===\s*$", re.M)
 LOG_LINE_CLIP = int(os.environ.get("WB_LOG_LINE_CLIP") or 480)
+
+_RE_ENTRY = re.compile(
+    r"^-*\s*\[(?P<who>[^\]]+)\]\s*(?:\[(?P<tag>[^\]]+)\]\s*)?"
+    r"(?P<act>.*?)\s+HTTP\s+(?P<http>\d{3})\s*"
+    r"(?:[（(](?P<note>[^）)]*)[）)])?[-\s]*$")
+_RE_METRIC = re.compile(
+    r"^\[(?P<who>[^\]]+)\]\s*(?:\[[^\]]+\]\s*)?[^\[]{0,24}?余额构成[:：]\s*"
+    r"套餐\s*(?P<tc>[-\d.]+)\s*\+\s*购买\s*(?P<buy>[-\d.]+)\s*\+\s*"
+    r"平台奖励\s*(?P<rw>[-\d.]+)\s*[;；]\s*前\s*(?P<before>[-\d.]+)\s*"
+    r"->\s*后\s*(?P<after>[-\d.]+)")
+
+# 动作名 → 人话（日志里写的是「读状态 travel/status」这种，取英文关键词映射；
+# 老版本写中文「派猫」，也一并认下）
+_ACT_NAMES = (
+    ("balance_before", "查余额（签到前）"),
+    ("balance_after", "查余额（签到后）"),
+    ("daily-checkin", "签到"),
+    ("checkin", "签到"),
+    ("travel/depart", "派猫出门"),
+    ("travel/claim", "领猫回家"),
+    ("travel/status", "查猫状态"),
+    ("redeem", "兑换"),
+    ("makeup", "补登"),
+    ("streak", "连登"),
+    ("daily-usage", "读每日用量"),
+    ("派猫", "派猫出行"),
+    ("领猫", "领猫回家"),
+)
+
+
+def _shorten(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[:n] + "…"
 
 
 def _fmt_size(n):
@@ -665,10 +704,187 @@ def _fmt_size(n):
 
 
 def _clip_line(line, limit=LOG_LINE_CLIP):
-    """单行过长就截断（保留行首，够看清是哪个请求/哪条报错）。"""
+    """单行过长就截断（只在「查看原始响应」里用）。"""
     if len(line) <= limit:
         return line
     return line[:limit] + "  …[本行共 %s，已截断]" % _fmt_size(len(line))
+
+
+def _pretty_act(act):
+    a = (act or "").strip()
+    low = a.lower()
+    for k, v in _ACT_NAMES:
+        if k in low:
+            return v
+    # 没命中映射：带了 `读状态 travel/status` 这种接口尾巴的，只留中文部分
+    m = re.match(r"^(.*\S)\s+\S*/\S*$", a)
+    if m:
+        return m.group(1)
+    return a or "请求"
+
+
+def _http_cls(code):
+    c = str(code)
+    if c.startswith("2"):
+        return "ok"
+    if c == "400":
+        return "warn"          # 业务性拒绝（今天已签到之类）不是故障
+    if c.startswith("4") or c.startswith("5"):
+        return "bad"
+    return "na"
+
+
+def _body_hint(text):
+    """从响应体里抽一句人话；抽不出来返回空串（调用方再决定是否显示原文）。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if t[:1] in "{[":
+        try:
+            d = json.loads(t)
+        except Exception:
+            return ""
+        if isinstance(d, dict):
+            for k in ("msg", "message", "error", "state"):
+                v = d.get(k)
+                if isinstance(v, str) and v.strip():
+                    extra = ""
+                    if k == "state":
+                        dd = d.get("data") if isinstance(d.get("data"), dict) else {}
+                        nm = dd.get("name") or dd.get("location") or ""
+                        extra = " · %s" % nm if nm else ""
+                    return _shorten(v.strip() + extra, 120)
+            if d.get("code") is not None:
+                return "code=%s" % d.get("code")
+        return ""
+    return _shorten(t.split("\n")[0], 120)
+
+
+def _entry_html(act, http, note, body_lines):
+    raw_txt = "\n".join(body_lines).strip()
+    hint = _body_hint(raw_txt)
+    bits = ["<div class='logrow'><span class='pill %s'>%s</span>"
+            % (_http_cls(http), html.escape(str(http))),
+            "<span class='act'>%s</span>" % html.escape(act)]
+    if hint:
+        bits.append("<span class='say'>%s</span>" % html.escape(hint))
+    if note:
+        bits.append("<span class='note'>%s</span>" % html.escape(note))
+    # 原始响应：没抽到摘要时一定给（不然信息就丢了）；抽到了就只在 body 很短时给
+    if raw_txt and (not hint or len(raw_txt) <= 300):
+        bits.append("<details class='raw'><summary>原始响应</summary><pre>%s</pre></details>"
+                    % html.escape("\n".join(_clip_line(l) for l in body_lines)))
+    bits.append("</div>")
+    return "".join(bits)
+
+
+def _metric_html(mm):
+    tc, buy, rw = mm.group("tc"), mm.group("buy"), mm.group("rw")
+    before, after = mm.group("before"), mm.group("after")
+    try:
+        diff = round(float(after) - float(before), 2)
+    except Exception:
+        diff = None
+    if diff is None or abs(diff) < 0.005:
+        dcls, dtxt = "flat", "持平"
+    elif diff > 0:
+        dcls, dtxt = "up", "+%g" % diff
+    else:
+        dcls, dtxt = "down", "%g" % diff
+    return ("<div class='logmetric'>"
+            "<span class='k'>套餐</span><b>%s</b>"
+            "<span class='k'>购买</span><b>%s</b>"
+            "<span class='k'>平台奖励</span><b>%s</b>"
+            "<span class='k'>结余</span><b>%s</b><span class='arrow'>→</span><b>%s</b>"
+            "<span class='delta %s'>%s</span></div>"
+            % (html.escape(tc), html.escape(buy), html.escape(rw),
+               html.escape(before), html.escape(after), dcls, html.escape(dtxt)))
+
+
+def _render_block_body(body):
+    """把一个运行块的内容渲染成「账号卡 + 请求行」。"""
+    lines = body.split("\n")
+    n = len(lines)
+    parts, card, who = [], [], None
+    i = 0
+
+    def flush():
+        nonlocal card, who
+        if card:
+            parts.append("<div class='logcard'><div class='who'>%s</div>%s</div>"
+                         % (html.escape(who or "运行"), "".join(card)))
+        card, who = [], None
+
+    while i < n:
+        raw = lines[i]
+        s = raw.strip()
+        if not s:
+            i += 1
+            continue
+        me = _RE_ENTRY.match(s)
+        if me:
+            person = me.group("who")
+            if who and person != who:
+                flush()
+            who = who or person
+            j, buf = i + 1, []
+            while j < n:
+                t = lines[j].strip()
+                if _RE_ENTRY.match(t) or _RE_METRIC.match(t):
+                    break
+                if t or buf:
+                    buf.append(lines[j])
+                j += 1
+            card.append(_entry_html(
+                _pretty_act("%s %s" % (me.group("tag") or "", me.group("act") or "")),
+                me.group("http"), (me.group("note") or "").strip(), buf))
+            i = j
+            continue
+        mm = _RE_METRIC.match(s)
+        if mm:
+            person = mm.group("who")
+            if who and person != who:
+                flush()
+            who = who or person
+            card.append(_metric_html(mm))
+            i += 1
+            continue
+        # 认不出来的行：原样保留（宁可丑，也不能丢信息）
+        (card if card else parts).append(
+            "<div class='%s'>%s</div>" % ("logline" if card else "loglead",
+                                          html.escape(_clip_line(raw))))
+        i += 1
+    flush()
+    if not parts:
+        return ("<div class='loglead'>（这次运行没有可解析的内容）</div>")
+    return "".join(parts)
+
+
+def _block_stat(body):
+    who, reqs = set(), 0
+    for ln in body.split("\n"):
+        s = ln.strip()
+        m = _RE_ENTRY.match(s)
+        if m:
+            reqs += 1
+            who.add(m.group("who"))
+            continue
+        mm = _RE_METRIC.match(s)
+        if mm:
+            who.add(mm.group("who"))
+    return len(who), reqs
+
+
+def _stat_text(n_acc, n_req, size, latest=False):
+    bits = []
+    if n_acc:
+        bits.append("%d 个账号" % n_acc)
+    if n_req:
+        bits.append("%d 条请求" % n_req)
+    bits.append(_fmt_size(size))
+    if latest:
+        bits.append("最新")
+    return " · ".join(bits)
 
 
 def _render_log_blocks(raw):
@@ -676,26 +892,28 @@ def _render_log_blocks(raw):
     txt = (raw or "").strip()
     if not txt:
         return "<div class='sub' style='margin:0 16px 16px'>（这一天还没有运行日志）</div>"
-    body_lines = lambda body: "\n".join(_clip_line(l) for l in body.split("\n"))
-    parts = _LOG_TS_RE.split(txt)
-    rest = parts[1:]
+    rest = _LOG_TS_RE.split(txt)[1:]
     blocks = [(rest[i].strip(), rest[i + 1].strip())
               for i in range(0, len(rest) - 1, 2)]
     if not blocks:
         # 没有 === 分隔：迁移前的 last_run.log，或单次原始输出
+        n_acc, n_req = _block_stat(txt)
         return ("<details class='logblk new' open><summary><b>本次运行</b>"
-                "<span class='mutd'>%s</span></summary><pre>%s</pre></details>"
-                % (html.escape(_fmt_size(len(txt))), html.escape(body_lines(txt))))
+                "<span class='meta'>%s</span></summary><div class='logbody'>%s</div>"
+                "</details>"
+                % (html.escape(_stat_text(n_acc, n_req, len(txt))),
+                   _render_block_body(txt)))
     out = []
     last = len(blocks) - 1
     for idx, (ts, body) in enumerate(blocks):
         new = idx == last
-        out.append(
-            "<details class='logblk%s'%s><summary><b>%s</b>"
-            "<span class='mutd'>%d 行 · %s%s</span></summary><pre>%s</pre></details>"
-            % (" new" if new else "", " open" if new else "",
-               html.escape(ts), len(body.split("\n")), _fmt_size(len(body)),
-               " · 最新" if new else "", html.escape(body_lines(body))))
+        n_acc, n_req = _block_stat(body)
+        out.append("<details class='logblk%s'%s><summary><b>%s</b>"
+                   "<span class='meta'>%s</span></summary><div class='logbody'>%s</div>"
+                   "</details>"
+                   % (" new" if new else "", " open" if new else "", html.escape(ts),
+                      html.escape(_stat_text(n_acc, n_req, len(body), new)),
+                      _render_block_body(body)))
     return "".join(out)
 
 
@@ -729,8 +947,9 @@ def view_logs(msg="", nonce="", date=None):
                       % (on, html.escape(d), html.escape(d)))
     sel = ('<div class="chips" style="margin:0 16px 12px">%s</div>' % chips) if chips else ""
     body = """<div class="panel"><h3>运行日志</h3>
-<div class="sub">历史日志按天保留 180 天，默认显示当日；点上面的日期查任意一天。
-每次运行单独成块，<b>最新一次默认展开</b>，点标题可展开/收起。</div>
+<div class="sub">历史日志按天保留 180 天，默认显示当日，点日期切换。
+每次运行一个块（<b>最新一次默认展开</b>）；块内按账号分组，请求行左边是 HTTP 状态码，
+后跟动作和结果摘要，想报文就点「原始响应」。完整数据看「报告」页。</div>
 %s
 <div class="sub" style="margin:10px 16px 4px">当前：<b>%s</b>（共 %d 天有记录）</div>
 %s</div>""" % (sel, html.escape(date), len(dates), _render_log_blocks(txt))

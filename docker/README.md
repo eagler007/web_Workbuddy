@@ -477,14 +477,22 @@ docker exec workbuddy /app/deploy/collect_usage.sh
 - 日志内容是**紧凑版**：`balance_before/after` 的巨大响应体只记一行 HTTP 状态，
   另给一行「余额构成: 套餐 X + 购买 Y + 平台奖励 Z; 前 A -> 后 B」；
   `checkin` 短 body 保留完整（签到成败判据）。想看完整响应去「报告」页。
-- **展示层再兜一道（分块折叠 + 单行截断）**：历史归档里的老块可能还带着修复前的
-  巨型 JSON（那是当天早些时候旧版本写进去的，文件不可回炉），所以渲染时：
-  - 每次运行 = 一个可折叠块（`<details>`），**最新一块默认展开**，其余收起；
-  - 单行超过 `WB_LOG_LINE_CLIP`（默认 480）字符自动截断并标注。
-  这样无论归档里有什么历史脏数据，日志页都不会被刷屏。
+- **日志页是结构化渲染，不是原始文本堆砌**（三层）：
+  - `=== 时间戳 ===` 一次运行 = 一个可折叠块，**最新一块默认展开**，标题带
+    「N 个账号 · M 条请求 · 大小」；
+  - 块内按 `[账号]` 归到**账号卡**；
+  - 请求行 = HTTP 状态码配色徽章（2xx 绿 / 400 黄 / 4xx·5xx 红）+ 动作人话
+    （`balance_before` → 查余额（签到前）、`travel/depart` → 派猫出门）+ 响应摘要
+    （优先抽 JSON 里的 `msg`/`state` 显示成一句话），原始报文收进「原始响应」折叠。
+  - 余额构成单独一条指标条：`套餐 / 购买 / 平台奖励 + 结余 A → B + 增减`（涨绿跌红）。
+  - **两代日志格式都能解析**（老格式 `[郑] 签到 balance_before  HTTP 200 -----` 也认）；
+    认不出的行原样保留，绝不丢信息；输出全部 HTML 转义。
+  - 历史归档里老版本写下的巨型 JSON：有摘要可抽就不展示原文，抽不到才折叠显示
+    （单行截断到 `WB_LOG_LINE_CLIP`，默认 480）。
 
 相关文件：`docker/runlog.py`（归档逻辑）、`docker/wb_daily.py`（调用 ingest）、
-`docker/app.py`（`_render_log_blocks` / `_clip_line`）、`deploy/run_daily.sh`（只负责 `--prune`）。
+`docker/app.py`（`_render_log_blocks` / `_render_block_body` / `_body_hint`）、
+`deploy/run_daily.sh`（只负责 `--prune`）。
 
 ---
 
@@ -566,7 +574,7 @@ DATA_DIR=./data python3 collect_usage.py --days 7 --print --dry-run
 | `test_runlog.py` | **日志历史化 + 签到误判修复**：按天归档不覆盖 / 不写凭据 / 180 天清理；`_is_ok` 优先 `ok` 布尔、服务端 `OK` 判成功 |
 | `test_compact_log.py` | **紧凑日志**：巨大 balance 响应不落盘、checkin 保留、余额构成一行、不泄漏套餐字段 |
 | `test_self_archive.py` | **wb_daily 自归档（E2E）**：桩掉网络跑 main() → `data/logs/今天.log` 生成、内容紧凑、重复跑只追加一块 |
-| `test_log_render.py` | **日志页渲染**：按运行块折叠（最新默认展开）/ 巨型单行截断 / HTML 转义 / 来源标签可读化 |
+| `test_log_render.py` | **日志页渲染**：运行块折叠（最新默认展开）/ 账号卡分组 / 动作人话化 / 状态码徽章 / JSON 摘要提取 / 余额指标条增减色 / 两代格式兼容 / HTML 转义 |
 | `test_redeem_plan.py` | 连登兑换计划（纯函数） |
 | `test_usage.py` / `test_usage_report.py` | 用量接口解析 / 面板渲染 |
 | `test_report_streak.py` | 连登渲染 / 降级 / 今日判定 / token 泄漏 / XSS |
