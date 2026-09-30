@@ -16,6 +16,7 @@ cat > "$CRON_FILE" <<EOF
 # WorkBuddy 每日签到 + 派猫；时间点由 CRON_SCHEDULE 控制（默认 7:30 / 13:30 / 17:30）
 $CRON_SCHEDULE /app/deploy/run_daily.sh >> /proc/1/fd/1 2>&1
 # 用量采集（只读）；默认每天早上 8:10 跑一次，窗口 WB_USAGE_DAYS（默认 30 天）
+# 采的是「前一天」（WB_USAGE_TARGET=prev）—— 当天数据有 2-3 小时延迟，早上采当天必然为空
 $USAGE_CRON /app/deploy/collect_usage.sh >> /proc/1/fd/1 2>&1
 EOF
 echo "[entry] crontab:"

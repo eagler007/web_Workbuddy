@@ -8,6 +8,8 @@ LOCK="$DATA_DIR/.collect_usage.lock"
 PY="$(command -v python3 || command -v python)"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DAYS="${WB_USAGE_DAYS:-30}"
+# prev（默认）= 采前一天：用量数据有 2–3 小时延迟，早上采当天必然为空
+TARGET="${WB_USAGE_TARGET:-prev}"
 
 mkdir -p "$DATA_DIR"
 
@@ -17,9 +19,10 @@ if ! flock -n 9; then
     exit 0
 fi
 
-echo "[collect_usage] 开始 $(date '+%F %T %Z') 窗口 ${DAYS} 天"
+echo "[collect_usage] 开始 $(date '+%F %T %Z') 窗口 ${DAYS} 天 · 目标 ${TARGET}"
 "$PY" "$HERE/collect_usage.py" \
     --days "$DAYS" \
+    --target "$TARGET" \
     --accounts "$DATA_DIR/wb_accounts.json" \
     --history "$DATA_DIR/usage_history.json" \
     --print

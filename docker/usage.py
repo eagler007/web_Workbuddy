@@ -141,12 +141,26 @@ def _jload(text):
         return None
 
 
-def usage_range(days):
-    """返回 (startTime, endTime) 字符串，按前端 li() 的格式。"""
+def usage_range(days, end_date=None):
+    """返回 (startTime, endTime) 字符串，按前端 li() 的格式。
+
+    end_date：窗口右端（含）的日期，"YYYY-MM-DD"，默认今天。
+
+    ⚠️ 为什么要这个参数：用量数据有 **2–3 小时延迟**，早上定时采集时
+    「今天」还没落库，采回来的当日消耗必然是空的（页面上显示「—」）。
+    采「昨天」才是完整有意义的一天 —— 见 `collect_usage.py --target prev`。
+    """
     days = max(1, min(int(days or USAGE_DEFAULT_DAYS), USAGE_MAX_DAYS))
-    today = datetime.date.today()
-    start = (today - datetime.timedelta(days=days - 1)).isoformat()
-    return start + " 00:00:00", today.isoformat() + " 23:59:59"
+    end = None
+    if end_date:
+        try:
+            end = datetime.date.fromisoformat(str(end_date)[:10])
+        except Exception:
+            end = None
+    if end is None:
+        end = datetime.date.today()
+    start = end - datetime.timedelta(days=days - 1)
+    return start.isoformat() + " 00:00:00", end.isoformat() + " 23:59:59"
 
 
 def _parse_records(text):
@@ -182,10 +196,14 @@ def _parse_records(text):
 
 
 # ---------------------------------------------------------------- 主查询
-def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller=None):
+def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller=None,
+                    end_date=None):
     """读真实积分消耗（请求级明细，客户端聚合）。
 
     返回结构化 dict，取不到就 days=[] 且 ok=False，绝不抛异常。
+
+    end_date："YYYY-MM-DD"，窗口右端（含），默认今天。传「昨天」即采昨日
+    （定时采集走这条，避开 2–3h 数据延迟，见 collect_usage.py）。
 
     返回字段：
       ok/http/err/raw_body/range[起,止]/path
@@ -196,17 +214,21 @@ def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller
       requests  : [{"ts","model","client","credit"}]  最多 MAX_REQUEST_ROWS 条（按时间倒序）
       total     : 窗口内请求条数
       sum       : 窗口合计积分
-      today     : 今日积分（可能为 0 / None）
+      today     : **真实今天**的积分（窗口不含今天时为 None）
+      target    : 窗口右端日期（= 窗口「最后一天」）
+      target_credit : 该日的积分（当天没记录 → None）
 
     caller：可选，注入的 HTTP 函数（见 _call_with_prefix_fallback）。
     """
     r = {"ok": False, "http": 0, "err": None, "days": [],
          "by_model": {}, "by_client": {}, "by_hour": {}, "requests": [],
          "total": None, "sum": None, "today": None,
+         "target": None, "target_credit": None,
          "raw_body": "", "range": None, "path": None}
     try:
-        st_t, en_t = usage_range(days)
+        st_t, en_t = usage_range(days, end_date=end_date)
         r["range"] = [st_t[:10], en_t[:10]]
+        r["target"] = en_t[:10]
         body = {"startTime": st_t, "endTime": en_t, "pageNum": 1, "pageSize": 500}
         st, text, used = _call_with_prefix_fallback(
             PATH_REQUEST_USAGE, token, uid, body, timeout=timeout, caller=caller)
@@ -260,9 +282,11 @@ def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller
         # 按日升序（方便画走势、和 report 对齐）
         days_out = [{"date": d, "credit": _r2(per_day[d])}
                     for d in sorted(per_day.keys())]
-        # 窗口合计 / 今日
+        # 窗口合计 / 今日 / 窗口末日
         total_credit = round(sum(per_day.values()), 2)
         today_credit = _r2(per_day.get(today_s)) if today_s in per_day else None
+        tgt = r["target"]
+        target_credit = _r2(per_day.get(tgt)) if tgt in per_day else None
 
         # 明细按时间倒序，截断
         out_reqs.sort(key=lambda x: x.get("ts") or "", reverse=True)
@@ -278,6 +302,7 @@ def get_daily_usage(token, uid, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, caller
         r["total"] = _int_or_none(total) if total is not None else len(recs)
         r["sum"] = total_credit
         r["today"] = today_credit
+        r["target_credit"] = target_credit
         r["ok"] = True
     except Exception as e:
         r["err"] = "%s: %s" % (type(e).__name__, e)
@@ -315,13 +340,15 @@ def fill_gaps(days, n=None):
 
 
 # ---------------------------------------------------------------- 多账号
-def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4, caller=None):
+def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4, caller=None,
+                   end_date=None):
     """并发查多个账号的用量。
 
     accounts: [{"name":..., "token":..., "uid":...}, ...]
+    end_date："YYYY-MM-DD" 窗口右端（含），默认今天。传昨天 = 采昨日。
     caller：可选，注入 HTTP 函数（测试桩用，见 get_daily_usage）。
     返回 [{"name","uid_masked","ok","err","http","sum","today","total",
-            "days","by_model","by_hour","requests","range"}, ...]
+            "target","target_credit","days","by_model","by_hour","requests","range"}, ...]
 
     隔离纪律：任一账号查询失败只影响它自己那一行，**绝不影响其它账号**，
     整体也不抛异常。
@@ -335,6 +362,7 @@ def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4
         uid_m = (uid[:8] + "…") if len(uid) > 8 else (uid or "-")
         row = {"name": name or uid_m, "uid_masked": uid_m, "ok": False,
                "err": None, "http": 0, "sum": None, "today": None,
+               "target": end_date, "target_credit": None,
                "total": None, "days": [], "by_model": {}, "by_hour": {},
                "requests": [], "range": None}
         if not token or not uid:
@@ -342,7 +370,8 @@ def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4
             out[i] = row
             return
         try:
-            du = get_daily_usage(token, uid, days=days, timeout=timeout, caller=caller)
+            du = get_daily_usage(token, uid, days=days, timeout=timeout, caller=caller,
+                                 end_date=end_date)
             row["ok"] = bool(du.get("ok"))
             row["err"] = du.get("err")
             row["http"] = du.get("http")
@@ -354,6 +383,8 @@ def query_accounts(accounts, days=USAGE_DEFAULT_DAYS, timeout=TIMEOUT, workers=4
             row["by_hour"] = du.get("by_hour") or {}
             row["requests"] = du.get("requests") or []
             row["range"] = du.get("range")
+            row["target"] = du.get("target") or end_date
+            row["target_credit"] = du.get("target_credit")
         except Exception as e:                       # 双保险
             row["err"] = "%s: %s" % (type(e).__name__, e)
         out[i] = row
@@ -433,6 +464,12 @@ def _selftest():
     s3, _ = usage_range(0)
     ck("0 天回落到默认 7 天",
        s3.startswith((datetime.date.today() - datetime.timedelta(days=6)).isoformat()))
+    # end_date：窗口右端可指定（定时采集采「昨天」就靠它）
+    s4, e4 = usage_range(7, end_date="2026-09-29")
+    ck("end_date 生效：右端 = 指定日", e4.startswith("2026-09-29"))
+    ck("end_date 左端 = 右端往前 6 天", s4.startswith("2026-09-23"))
+    _, e5 = usage_range(7, end_date="坏数据")
+    ck("end_date 坏值回落今天", e5.startswith(datetime.date.today().isoformat()))
 
     print("[2] get_daily_usage 解析 + 聚合（假接口）")
     r = get_daily_usage("t", "u", days=7, caller=fake_call)
@@ -448,6 +485,11 @@ def _selftest():
     ck("by_hour 21=2.5", abs(r["by_hour"].get(21, 0) - 2.5) < 1e-6)
     ck("requests 截断≤300", len(r["requests"]) <= MAX_REQUEST_ROWS)
     ck("requests 倒序", r["requests"][0]["ts"] >= r["requests"][-1]["ts"])
+
+    rt = get_daily_usage("t", "u", days=7, caller=fake_call, end_date="2026-09-28")
+    ck("target = 窗口右端", rt["target"] == "2026-09-28")
+    ck("target_credit = 该日合计 4.0", abs((rt["target_credit"] or 0) - 4.0) < 1e-6)
+    ck("窗口不含今天 → today=None", rt["today"] is None)
 
     print("[3] invalid params / 401 优雅降级")
     def bad_call(method, url, token, uid, body, timeout=TIMEOUT):

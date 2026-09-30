@@ -1392,8 +1392,14 @@ def _heat_grid(dates, per_day):
     return '<div class="heat">%s</div>' % "".join(cells)
 
 
-def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached=False):
-    """用量看板：自动请求真实接口，展示每个账号的积分消耗。"""
+def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached=False,
+               acc=None):
+    """用量看板：自动请求真实接口，展示积分消耗。
+
+    acc：聚焦到某个账号（名字精确匹配）。空 = 全部账号合并显示。
+    多账号时页面上有一排账号药丸可切换 —— 老板要的是「选一个账号看它自己的」，
+    而不是所有账号揉在一张图里（2026-09-30）。
+    """
     try:
         days = max(1, min(int(days or os.environ.get("WB_USAGE_DAYS")
                               or USAGE_DEFAULT_VIEW_DAYS), 31))
@@ -1402,6 +1408,17 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
     if rows is None:
         rows, err, ts, cached = _usage_rows_cached(days)
 
+    # ---- 账号聚焦：先把全量留下来（明细表 / 切换器要用），再切出「参与统计的行」
+    all_rows = list(rows or [])
+    names_all = []
+    for r in all_rows:
+        nm = r.get("name") or "-"
+        if nm not in names_all:
+            names_all.append(nm)
+    focus = (acc or "").strip()
+    if focus and focus not in names_all:
+        focus = ""                      # 名字不存在（改名了 / 手打 URL）→ 回落「全部」
+    rows = [r for r in all_rows if (not focus or (r.get("name") or "-") == focus)]
     ok_rows = [r for r in rows if r.get("ok")]
     n_ok, n_all = len(ok_rows), len(rows)
     total_sum = None
@@ -1439,20 +1456,42 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
     body = '<div class="kpis">%s</div>' % "".join(kpis)
 
     # ---- 窗口切换 + 刷新
+    def _acc_url(name):
+        """切换账号时保留当前窗口天数（`&` 转义成 `&amp;` 才是合法 HTML 属性）。"""
+        return "/usage?days=%d%s" % (
+            days,
+            ("&amp;acc=" + urllib.parse.quote(str(name), safe="")) if name else "")
+
     chips = ""
     for d in (1, 3, 7, 14, 30):
-        chips += ('<a class="chip%s" href="/usage?days=%d">%d 天</a>'
-                  % (" on" if d == days else "", d, d))
-    body += """<div class="panel"><h3>查询窗口</h3>
-<div class="actions" style="padding:6px 16px 14px">
+        chips += ('<a class="chip%s" href="%s">%d 天</a>'
+                  % (" on" if d == days else "", _acc_url(focus), d))
+    # 账号切换器：多账号时才有意义（选一个账号 = 只看它自己的所有图）
+    acc_row = ""
+    if len(names_all) >= 2:
+        acc_chips = ('<a class="chip%s" href="%s">全部账号</a>'
+                     % (" on" if not focus else "", _acc_url("")))
+        for nm in names_all:
+            acc_chips += ('<a class="chip%s" href="%s">%s</a>'
+                          % (" on" if nm == focus else "",
+                             _acc_url(nm), html.escape(nm)))
+        acc_row = ('<div class="sub" style="padding:2px 16px 6px">账号'
+                   '（点一个只看它自己的数据）</div>'
+                   '<div class="chips" style="padding:0 16px 14px">%s</div>'
+                   % acc_chips)
+    body += """<div class="panel"><h3>查询范围</h3>
+<div class="actions" style="padding:6px 16px 8px">
 <div class="chips">%s</div>
 <form method="post" action="/usage/refresh" style="margin-left:auto">
 <input type="hidden" name="csrf" value="%s"><input type="hidden" name="days" value="%d">
+<input type="hidden" name="acc" value="%s">
 <button type="submit" class="ghost">重新查询</button></form>
 </div>
+%s
 <div class="sub" style="padding:0 16px 14px">每次打开本页会<strong>自动请求真实接口</strong>拉取账号级积分消耗
-（同一窗口 %d 秒内复用缓存）。点「重新查询」强制刷新。</div></div>""" % (
-        chips, nonce, days, USAGE_CACHE_TTL)
+（同一窗口 %d 秒内复用缓存）。点「重新查询」强制刷新。%s</div></div>""" % (
+        chips, nonce, days, html.escape(focus), acc_row, USAGE_CACHE_TTL,
+        ("当前只统计<strong>%s</strong>一个账号。" % html.escape(focus)) if focus else "")
 
     if err:
         body += '<div class="msg bad">查询出错：%s</div>' % html.escape(str(err))
@@ -1550,7 +1589,8 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
                     ("%.2f" % float(r["sum"])) if r.get("sum") is not None else "—",
                     _bars_svg(pairs)))
     if mini:
-        body += '<div class="panel"><h3>各账号每日消耗</h3>%s</div>' % mini
+        _mt = (html.escape(focus) + " 每日消耗") if focus else "各账号每日消耗"
+        body += '<div class="panel"><h3>%s</h3>%s</div>' % (_mt, mini)
 
     # ---- 请求级明细（跨账号，按时间倒序）
     if _all_reqs:
@@ -1574,11 +1614,13 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
                  '只含模型 / 客户端 / 积分，不含任何凭据。</p></div>'
                  % (len(_all_reqs[:100]), _rtrs))
 
-    # ---- 定时采集历史（每天早上跑的那一轮）
+    # ---- 每日消耗（定时采集落下的）
+    # 键 = 「数据归属日」（v2 起）。老记录（v1）的键是采集日、字段叫 today，也兼容。
     hist = load_usage_history()
     hbd = hist.get("by_date") or {}
+    _ucron = html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *")
     if hbd:
-        hkeys = sorted(hbd.keys())[-14:]
+        hkeys = sorted(hbd.keys())[-21:]
         # 名称集合（按采集记录里出现过的账号）
         names, seen = [], set()
         for k in reversed(hkeys):
@@ -1587,6 +1629,8 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
                 if nm not in seen:
                     seen.add(nm)
                     names.append(nm)
+        if focus:                       # 聚焦某账号时，这张表也只留它那一列
+            names = [n for n in names if n == focus] or [focus]
         ths = "".join("<th>%s</th>" % html.escape(n) for n in names)
         trs2 = ""
         for k in reversed(hkeys):
@@ -1594,42 +1638,63 @@ def view_usage(msg="", nonce="", days=None, rows=None, err=None, ts=None, cached
             cellmap = {}
             for a in (rec.get("accounts") or []):
                 cellmap[a.get("name") or "-"] = a
-            tds = ""
+            tds, tot, tot_ok = "", 0.0, False
             for n in names:
                 a = cellmap.get(n)
                 if a is None:
                     tds += '<td class="na">·</td>'
                 elif not a.get("ok"):
-                    tds += '<td><span class="st bad" title="%s">失败</span></td>' % \
-                        html.escape(str(a.get("err") or "")[:60])
+                    tds += ('<td><span class="st bad" title="%s">失败</span></td>'
+                            % html.escape(str(a.get("err") or "查询失败")[:80]))
                 else:
-                    t = a.get("today")
-                    tds += ('<td class="credit">%s</td>'
-                            % (("%.2f" % float(t)) if t is not None
-                               else '<span class="mut">—</span>'))
-            trs2 += ('<tr><td class="acc">%s</td><td class="mut" '
-                     'style="font-size:11.5px">%s</td>%s</tr>'
-                     % (html.escape(k), html.escape(str(rec.get("ts") or "")[11:16]),
-                        tds))
-        body += ('<div class="panel"><h3>定时采集历史</h3>'
-                 '<div class="sub">容器里每天 <code>%s</code> 自动跑一次用量采集'
-                 '（cron：<code>%s</code>），下表是每次采到的「当日消耗」。'
-                 '格子里是积分，<span class="st bad">失败</span>表示那次没查通。</div>'
-                 '<div class="scroll"><table><tr><th>日期</th><th>时间</th>%s</tr>%s'
+                    v = a.get("credit")
+                    if v is None:
+                        v = a.get("today")          # v1 老记录字段
+                    if v is None:
+                        tds += '<td class="mut">—</td>'
+                    else:
+                        try:
+                            tot += float(v)
+                            tot_ok = True
+                        except (TypeError, ValueError):
+                            pass
+                        tds += '<td class="credit">%.2f</td>' % float(v)
+            # v1 老记录里「采集当天还没落库」留下的全空行（一排「—」）：没有信息量，不渲染。
+            # 2026-09-30 老板截图里那行「8:10 两个账号都是 —」就是这种。
+            if not rec.get("v"):
+                blank = tds.count('class="mut">—') + tds.count('class="na">·')
+                if blank == len(names):
+                    continue
+            # 聚焦单账号时「合计」= 它自己那一格，不重复展示
+            trs2 += ('<tr><td class="acc" title="采集于 %s">%s</td>%s%s</tr>'
+                     % (html.escape(str(rec.get("ts") or "")), html.escape(k), tds,
+                        "" if focus else
+                        ('<td class="credit">%s</td>'
+                         % (("%.2f" % tot) if tot_ok else '<span class="mut">—</span>'))))
+        if not trs2:
+            trs2 = ('<tr><td colspan="%d" class="mut" style="text-align:center">'
+                    '（暂无有效记录）</td></tr>'
+                    % (1 + len(names) + (0 if focus else 1)))
+        body += ('<div class="panel"><h3>每日消耗（定时采集）</h3>'
+                 '<div class="sub">容器里每天 <code>%s</code> 自动采一次'
+                 '（cron：<code>%s</code>），采的是<strong>前一天</strong>的完整消耗'
+                 '——官方明说用量数据有 2–3 小时延迟，早上采「当天」必然一片空。'
+                 '表里每一行 = 对应日期的消耗（悬停日期看采集时刻），'
+                 '格子里是积分，<span class="st bad">失败</span>表示那次没查通'
+                 '（悬停看原因）。</div>'
+                 '<div class="scroll"><table><tr><th>日期</th>%s%s</tr>%s'
                  '</table></div>'
                  '<p class="hint" style="padding:0 16px 14px">最近更新 %s · 共 %d 天记录'
-                 '（保留最近 180 天）</p></div>'
-                 % (html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *"),
-                    html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *"),
-                    ths, trs2,
+                 '（保留最近 180 天）。2026-09-30 之前的老记录按「采集当天」记、'
+                 '当时还没落库的空行已自动隐藏。</p></div>'
+                 % (_ucron, _ucron, ths, "" if focus else "<th>合计</th>", trs2,
                     html.escape(str(hist.get("updated") or "—")), len(hbd)))
     else:
-        body += ('<div class="panel"><h3>定时采集历史</h3>'
-                 '<p class="trim">还没有采集记录。容器里每天早上会自动跑一次'
-                 '（cron <code>%s</code>）；也可以手动执行 '
+        body += ('<div class="panel"><h3>每日消耗（定时采集）</h3>'
+                 '<p class="trim">还没有采集记录。容器里每天早上会自动采一次'
+                 '（cron <code>%s</code>，采前一天）；也可以手动执行 '
                  '<code>docker exec &lt;容器&gt; /app/deploy/collect_usage.sh</code> '
-                 '立刻采一轮。</p></div>'
-                 % html.escape(os.environ.get("USAGE_CRON") or "10 8 * * *"))
+                 '立刻采一轮。</p></div>' % _ucron)
 
     body += """<div class="panel"><h3>口径说明</h3><div class="sub" style="padding:0 16px 16px">
 <strong>这里查的是「积分消耗」，不是原始 token 数。</strong>CodeBuddy 采用积分计费，
@@ -1782,7 +1847,8 @@ class Handler(BaseHTTPRequestHandler):
                 _d = int((qs.get("days") or [""])[0])
             except Exception:
                 _d = None
-            return self._send(200, view_usage(nonce=nonce, days=_d))
+            _acc = (qs.get("acc") or [""])[0]
+            return self._send(200, view_usage(nonce=nonce, days=_d, acc=_acc))
         if path == "/usage/data":
             # JSON 接口：给页面做「自动定时刷新」用，也方便你自己 curl
             try:
@@ -1872,7 +1938,8 @@ class Handler(BaseHTTPRequestHandler):
                 _msg = (True, "已重新查询：%d 天窗口，%d/%d 个账号返回数据。"
                         % (_d, _n_ok, len(_rows)))
             return self._send(200, view_usage(msg=_msg, nonce=nonce, days=_d,
-                                              rows=_rows, err=_err, ts=_ts))
+                                              rows=_rows, err=_err, ts=_ts,
+                                              acc=(form.get("acc") or "").strip()))
         if path == "/update/check":
             info = check_update()
             okc = info.get("behind")

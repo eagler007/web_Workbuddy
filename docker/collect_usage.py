@@ -6,31 +6,40 @@
 
     python collect_usage.py                 # 用 data/wb_accounts.json 里的账号
     python collect_usage.py --days 30       # 指定窗口
+    python collect_usage.py --target today  # 采当天（默认采「前一天」）
     python collect_usage.py --print         # 同时把摘要打到 stdout（定时任务日志里能看）
 
 设计要点：
   - **只读**：只调查询接口，不写任何远端状态。
   - **隔离**：单个账号失败不影响其它账号；整体失败不影响退出码语义（退出码只表示「有没有落盘」）。
-  - **合并历史**：同一天重复跑会**覆盖当天**记录（幂等），不是追加出重复行。
+  - **采「前一天」**（`--target prev`，默认）：官方明说用量数据有 **2–3 小时延迟**，
+    早上 8:10 采「当天」必然一片空（页面上一排「—」，2026-09-30 老板反馈的正是这个）。
+    采昨天 = 一整天完整数据，且离采集时刻至少已过去 8 小时，数据一定落库了。
+  - **键 = 数据归属日**（v2 起）：一次请求就拿回整个窗口的按日数据，所以顺手把窗口里
+    每一天都落一格 —— 历史表不会因为容器停过几天就断档，也不需要额外请求。
+  - **不拿失败盖掉好数据**：某个账号这次查失败时，若它在这天已有成功记录，**保留原值**。
   - **不含 token**：落盘内容只有账号名、掩码 UID、日期与积分，**没有任何凭据**。
 
-数据文件结构（data/usage_history.json）：
+数据文件结构（data/usage_history.json，v2）：
     {
-      "version": 1,
+      "version": 2,
       "updated": "YYYY-MM-DD HH:MM:SS",
       "days": 30,
-      "by_date": {                       # 按「采集日期」归并，重跑覆盖
-         "2026-09-28": {
-            "ts": "2026-09-28 08:00:12",
-            "days": 30,
+      "target_mode": "prev",
+      "by_date": {                       # 键 = 数据归属日（不是采集日）
+         "2026-09-29": {
+            "ts": "2026-09-30 08:10:12",  # 这一格最后一次被采到的时刻
+            "v": 2,
+            "target": "2026-09-29",
             "accounts": [
               {"name":"本机","uid_masked":"11111111…","ok":true,
-               "sum":123.45,"today":12.3,
-               "series":[{"date":"2026-08-30","credit":1.2}, ...]}
+               "credit":12.34,"sum":123.45,"total":180,"http":200,"err":null}
             ]
          }
       }
     }
+
+> v1 的键是「采集日」、字段叫 `today`；读取端（app.py / 页面）两种都认。
 """
 
 import argparse
@@ -137,58 +146,155 @@ def slim_rows(rows, keep_series=True):
     return out
 
 
-def collect(days=30, accounts=None, history=None, accounts_file=None):
+TARGET_PREV = "prev"
+TARGET_TODAY = "today"
+
+
+def resolve_target(mode=None, today=None):
+    """把 target 模式解析成「窗口右端日期」。返回 (end_date_iso, mode)。
+
+    prev（默认）：采集日的**前一天** —— 当天数据有 2–3h 延迟，早上采「今天」必空。
+    today：采集日当天（想傍晚采当天就用这个）。
+    """
+    d = today or datetime.date.today()
+    m = (mode or os.environ.get("WB_USAGE_TARGET") or TARGET_PREV).strip().lower()
+    if m not in (TARGET_PREV, TARGET_TODAY):
+        m = TARGET_PREV
+    end = d - datetime.timedelta(days=1) if m == TARGET_PREV else d
+    return end.isoformat(), m
+
+
+def window_dates(days, end_iso):
+    """窗口内所有日期，升序（含 end_iso）。"""
+    try:
+        end = datetime.date.fromisoformat(str(end_iso)[:10])
+    except Exception:
+        end = datetime.date.today()
+    days = max(1, min(int(days or 30), 31))
+    return [(end - datetime.timedelta(days=i)).isoformat()
+            for i in range(days - 1, -1, -1)]
+
+
+def _credit_on(row, date):
+    """某账号在指定日期的积分。
+
+    ⚠️ 窗口内**没有记录 = 0.0**，不是 None —— 那个账号那天确实没调用。
+    返回 None 会让页面上又出现一排「—」（就是老板截图里那个问题）。
+    """
+    for it in (row.get("days") or []):
+        if (it.get("date") or "")[:10] == date:
+            try:
+                return round(float(it.get("credit")), 2)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _cell(row, date):
+    """把一个账号的结果转成某一天的落盘格子（含成功/失败两种形态）。"""
+    c = {"name": row.get("name") or "-",
+         "uid_masked": row.get("uid_masked") or "-",
+         "ok": bool(row.get("ok")),
+         "http": row.get("http"),
+         "err": (str(row.get("err"))[:120] if row.get("err") else None)}
+    if c["ok"]:
+        c["credit"] = _credit_on(row, date)
+        c["sum"] = row.get("sum")
+        c["total"] = row.get("total")
+    return c
+
+
+def write_window(h, rows, days, end_iso, ts):
+    """把这一轮拿到的窗口数据写进历史（**键 = 数据归属日**）。返回写了多少天。
+
+    - 一次请求拿回整个窗口的按日数据 → 窗口里每一天都落一格（历史不会断档）。
+    - 某账号这次失败时，若它在这天已有成功记录 → **保留原值**（别用失败盖掉好数据）。
+    - 全部账号都失败 → 只写窗口右端一格的失败痕迹，不动其它日期。
+    """
+    bd = h.setdefault("by_date", {})
+    n_ok = len([r for r in rows if r.get("ok")])
+    dates = window_dates(days, end_iso) if n_ok > 0 else [end_iso]
+    for d in dates:
+        prev = bd.get(d) if isinstance(bd.get(d), dict) else {}
+        old = {}
+        for a in (prev.get("accounts") or []):
+            if isinstance(a, dict) and a.get("name"):
+                old[a["name"]] = a
+        cells = []
+        for r in rows:
+            nm = r.get("name") or "-"
+            keep = old.get(nm)
+            if not r.get("ok") and isinstance(keep, dict) and keep.get("ok"):
+                cells.append(keep)          # 保留这天已有的好数据
+            else:
+                cells.append(_cell(r, d))
+        bd[d] = {"ts": ts, "v": 2, "target": d, "accounts": cells}
+    return len(dates)
+
+
+def collect(days=30, accounts=None, history=None, accounts_file=None, target=None):
     """跑一轮采集，返回 (rows, 落盘后的 history)。不写盘。"""
     accs = accounts if accounts is not None else load_accounts(accounts_file)
     if not accs:
         _log("没有账号（%s 为空或不含 token/uid）" % ACCOUNTS_FILE)
         return [], history or load_history()
-    _log("开始采集 %d 个账号 · 窗口 %d 天" % (len(accs), days))
-    rows = U.query_accounts(accs, days=days)
+    end_iso, mode = resolve_target(target)
+    _log("开始采集 %d 个账号 · 窗口 %d 天 · 目标日 %s（%s）"
+         % (len(accs), days, end_iso, "前一日" if mode == TARGET_PREV else "当日"))
+    rows = U.query_accounts(accs, days=days, end_date=end_iso)
     n_ok = len([r for r in rows if r.get("ok")])
     _log("采集完成：%d/%d 个账号返回数据" % (n_ok, len(rows)))
     for r in rows:
         if r.get("ok"):
-            _log("  %-12s 今日 %-8s %d 天合计 %s" % (
-                r.get("name"), r.get("today"), days, r.get("sum")))
+            tc = r.get("target_credit")
+            if tc is None:
+                tc = _credit_on(r, end_iso)
+            _log("  %-12s %s 消耗 %-8s %d 天合计 %s" % (
+                r.get("name"), end_iso, tc, days, r.get("sum")))
         else:
             _log("  %-12s 失败：%s" % (r.get("name"), r.get("err")))
 
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     h = history or load_history()
-    key = datetime.date.today().isoformat()
     h.setdefault("by_date", {})
-    # 幂等：同一天重跑覆盖当天，不追加重复行
-    h["by_date"][key] = {
-        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "days": days,
-        "accounts": slim_rows(rows),
-    }
+    n_written = write_window(h, rows, days=days, end_iso=end_iso, ts=ts)
+    if n_ok:
+        _log("已落盘：%d 天记录（目标日 %s，键 = 数据归属日）" % (n_written, end_iso))
+    else:
+        _log("全部账号失败：只在 %s 留一格失败痕迹，不覆盖已有历史" % end_iso)
     # 只留最近 180 天，别让文件无限长
     keys = sorted(h["by_date"].keys())
     if len(keys) > 180:
         for k in keys[:-180]:
             h["by_date"].pop(k, None)
-    h["version"] = 1
+    h["version"] = 2
     h["days"] = days
-    h["updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    h["target_mode"] = mode
+    h["updated"] = ts
     return rows, h
 
 
-def print_summary(rows, days):
+def print_summary(rows, days, target=None):
     """把摘要打到 stdout —— 定时任务的日志里能直接看到。"""
     n_ok = len([r for r in rows if r.get("ok")])
+    end_iso = next((r.get("target") for r in rows if r.get("target")), None)
+    if not end_iso:
+        end_iso, _ = resolve_target(target)
     print("")
     print("=" * 58)
-    print("WorkBuddy 用量采集 · %s · 窗口 %d 天" %
-          (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), days))
+    print("WorkBuddy 用量采集 · %s · 窗口 %d 天 · 目标日 %s" %
+          (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), days, end_iso))
     print("=" * 58)
     if not rows:
         print("没有账号可查。")
     for r in rows:
         if r.get("ok"):
-            print("  %-12s 今日 %-10s %d 天合计 %s" % (
-                r.get("name") or "-",
-                r.get("today") if r.get("today") is not None else "—",
+            tc = r.get("target_credit")
+            if tc is None:
+                tc = _credit_on(r, end_iso)
+            print("  %-12s %s %-10s %d 天合计 %s" % (
+                r.get("name") or "-", end_iso,
+                tc if tc is not None else "—",
                 days, r.get("sum") if r.get("sum") is not None else "—"))
         else:
             print("  %-12s 失败：%s" % (r.get("name") or "-", r.get("err")))
@@ -205,6 +311,10 @@ def main(argv=None):
                     help="查询窗口天数，默认 30，上限 31")
     ap.add_argument("--accounts", default=ACCOUNTS_FILE, help="账号文件路径")
     ap.add_argument("--history", default=HISTORY_FILE, help="历史文件路径")
+    ap.add_argument("--target", default=os.environ.get("WB_USAGE_TARGET") or TARGET_PREV,
+                    choices=[TARGET_PREV, TARGET_TODAY],
+                    help="采哪一天：prev=前一天（默认，避开 2–3h 数据延迟），"
+                         "today=当天")
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="把摘要打到 stdout")
     ap.add_argument("--dry-run", action="store_true", help="只查不落盘")
@@ -214,7 +324,8 @@ def main(argv=None):
     hist_file = args.history
     days = max(1, min(int(args.days or 30), 31))
     try:
-        rows, h = collect(days=days, accounts_file=acc_file, history=load_history(hist_file))
+        rows, h = collect(days=days, accounts_file=acc_file,
+                          history=load_history(hist_file), target=args.target)
     except Exception as e:
         _log("采集异常：%s: %s" % (type(e).__name__, e))
         return 1
@@ -224,7 +335,7 @@ def main(argv=None):
         return 1
 
     if args.do_print:
-        print_summary(rows, days)
+        print_summary(rows, days, target=args.target)
 
     if args.dry_run:
         _log("dry-run：不落盘")
