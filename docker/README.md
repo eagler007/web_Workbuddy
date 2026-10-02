@@ -97,10 +97,52 @@ docker compose exec workbuddy python3 /app/wb_daily.py --doctor
 
 文件里 `auth.accessToken` 是 token，`account.uid` 是 uid。
 
-> 新版本把这个文件加密了（值形如 `{"$wbEncrypted":1,"envelope":"..."}`），
-> 浏览器 F12 → Network → 任一接口请求头里的 `Authorization: Bearer ...` 和 `X-User-Id`。
+### 用 `local_token.py` 读（推荐，加密之后唯一省事的办法）
 
-Token 有效期约 60 天，过期后签到会返回 401 —— 到「账号」页用同一个 UID 重新提交一次新 token 即可（不用删了重建）。
+**5.6.2 起这个文件被加密了**：`auth.accessToken`、`auth.refreshToken`、
+`account.nickname`、`account.phoneNumber` 四项变成 AES-256-GCM 信封
+（值形如 `{"$wbEncrypted":1,"envelope":"..."}`），**主密钥只在客户端主进程内存里**
+——不落盘、不写钥匙串、也不发给子进程。所以「打开文件抄 token」这条路已经断了。
+
+项目根目录的 `local_token.py` 解决这件事（只在装了客户端的机器上跑）：
+
+```bash
+python local_token.py check     # 看账号 / UID / AT·RT 剩多少天（**不打印 token**）
+python local_token.py export    # 输出 JSON，复制粘贴到「账号」页
+python local_token.py export --out D:/wb_creds.json   # 落盘（600 权限，别放 git 里）
+python local_token.py push --url http://192.168.2.12:18080 --password <WEB_PASSWORD>
+```
+
+`push` 会自己登录容器、把新 token 提交到「账号」页（CSRF 就是会话 cookie 的中间段，
+不需要抓页面），跑完直接看得到测活结果。
+
+原理：WorkBuddy 桌面端本身就是 Electron 应用，**同一个可执行文件**带上
+`ELECTRON_RUN_AS_NODE=1` 就不再以 GUI 启动，而是一个普通 Node 进程 ——
+天然带着客户端注册的原生模块（`electron_browser_workbuddy_storage`）。
+脚本在这个子进程里问出主密钥、就地解密，明文只经内存管道回到本进程。
+
+> 这不是「破解」：调用的是客户端自己注册的接口，跟客户端自己读登录态走的是同一条路。
+> 密钥全程不落盘、不出子进程，用完即清零；只要客户端还能正常登录，这条路就成立。
+> 反过来，哪天客户端把这个模块的对外接口收了，它就会失效。
+
+| | 加密前 | 加密后（5.6.2+） |
+|---|---|---|
+| `auth.accessToken` | 明文 JWT，`eyJhbGci...` | `{"$wbEncrypted":1,"envelope":"…"}` |
+| 能不能直接抄 | 能 | **不能**，必须走 `local_token.py` |
+
+**手工兜底**（没有本机客户端时）：浏览器 F12 → Network → 任一接口请求头里的
+`Authorization: Bearer <token>` 和 `X-User-Id: <uid>`。
+
+### 有效期与续期
+
+| | 实测寿命 | 说明 |
+|---|---|---|
+| accessToken | **约 30 天** | 签到实际用的就是它；过期 → 401 |
+| refreshToken | 约 60 天 | 比 AT 多活一个月，本机登录时会自动刷新 AT |
+
+过期后到「账号」页用**同一个 UID** 重新提交新 token 即可（不用删了重建）；
+「账号」页的「AT 剩余」列 ≤3 天会标红，推送里也会带「⚠️ Token 即将到期」区块。
+不想手动盯，就定期跑一次 `local_token.py check`，或者同网段时用 `push` 直接推上去。
 
 ---
 
